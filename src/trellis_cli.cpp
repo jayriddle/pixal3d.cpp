@@ -579,9 +579,9 @@ int trellis_run_mv(const trellis::TrellisParams& cfg) {
         trellis::Mesh rm = trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(), bvh, so.res, remesh_band);
         if (rm.F() > 0) {
             trellis::clean_mesh(rm.V(), rm.faces);
-            // 2% always, plus a detached shell under 3% of the body. The gap is
-            // measured here, before QEM moves face share around. The 3% pass
-            // below still drops flats that collapse after simplification.
+            // 2% always, plus a detached shell under 3% of the body. Measured
+            // here, before QEM moves face share around. The same rule runs
+            // again after QEM so an against-body part is not deleted later.
             int ndrop = trellis::drop_pre_decimation_components(rm.verts, rm.faces, trellis::remesh_voxel_world(so.res, remesh_band));
             printf("  remesh postproc: dropped %d floater comps -> V=%d F=%d\n", ndrop, rm.V(), rm.F());
         }
@@ -597,7 +597,7 @@ int trellis_run_mv(const trellis::TrellisParams& cfg) {
             trellis::decimate_qem(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3, cfg.qem_face_target(true), dv, df);
             trellis::weld_vertices(dv, df, nullptr, 1.0f / ((float)so.res * 8.0f));
             trellis::fill_small_holes(df);
-            int ndrop2 = trellis::drop_small_components(dv, df, 0.03f);
+            int ndrop2 = trellis::drop_pre_decimation_components(dv, df, trellis::remesh_voxel_world(so.res, remesh_band));
             if (ndrop2) printf("  decimated postproc: dropped %d more comps -> F=%d\n", ndrop2, (int)df.size()/3);
         }
         const int dV = (int)dv.size()/3, dF = (int)df.size()/3;
@@ -1100,10 +1100,9 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                                   cfg.qem_face_target(false), dv, df);
             trellis::weld_vertices(dv, df, nullptr, 1.0f / ((float)so.res * 8.0f));
             trellis::fill_small_holes(df);
-            // Second component pass on the decimated mesh: a hallucinated ground plane
-            // survives the dense-mesh drop (it decimates to a large flat slab) but is a
-            // small fraction here and disconnected from the body. Ref is a single component.
-            int ndrop2 = trellis::drop_small_components(dv, df, 0.03f);
+            // Same rule as the pre-pass. A flat slab that collapses and stays
+            // detached is dropped; a part that was against the body is not.
+            int ndrop2 = trellis::drop_pre_decimation_components(dv, df, trellis::remesh_voxel_world(so.res, remesh_band));
             if (ndrop2) { printf("  decimated postproc: dropped %d more comps -> F=%d\n", ndrop2, (int)df.size()/3); fflush(stdout); }
         }
         const int dV = (int)dv.size()/3, dF = (int)df.size()/3;

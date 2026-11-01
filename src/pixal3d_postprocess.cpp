@@ -69,7 +69,7 @@ bool pixal3d_write_production_glb(const std::string& out_glb, Mesh mesh,
         decimate_qem(src_v, (int)src_v.size()/3, src_f, (int)src_f.size()/3, opt.target_faces, dv, df);
         weld_vertices(dv, df, nullptr, 1.0f / ((float)rres * 8.0f));
         fill_small_holes(df);
-        drop_small_components(dv, df, 0.03f);
+        drop_pre_decimation_components(dv, df, remesh_voxel_world(rres, opt.remesh_band));
     } else { plog(os, "postprocess: qem skipped (F=%d <= target)", (int)src_f.size()/3); dv = src_v; df = src_f; }
     plog(os, "postprocess: qem done V=%zu F=%zu", dv.size()/3, df.size()/3);
 

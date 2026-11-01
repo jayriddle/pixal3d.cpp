@@ -6,6 +6,7 @@
 #include "uv_bake.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -431,7 +432,7 @@ int main() {
             std::vector<float> ov;
             std::vector<int32_t> of;
             trellis::decimate_qem(a, (int)a.size() / 3, b, (int)b.size() / 3, 900, ov, of);
-            trellis::drop_small_components(ov, of, 0.03f);
+            trellis::drop_pre_decimation_components(ov, of, voxel);
             const auto after = comp_sizes(ov, of);
             const float xmax = bbox_max_x(ov);
             float xmin = 1e9f, ymin = 1e9f;
@@ -453,6 +454,134 @@ int main() {
             if (after.empty() || after[0] < 200)
                 rc |= fail("main body collapsed below the QEM target's useful range");
         }
+    }
+
+    // QEM no-op: face shares stay put. A second pass must keep the attached
+    // 2.5% part (the old post-QEM 3% face cut would delete it) and drop a far shell.
+    {
+        const float voxel = 0.01f;
+        std::vector<float> v;
+        std::vector<int32_t> f;
+        add_grid(v, f, 40);
+        const int body = (int)f.size() / 3;
+        auto add_fan = [&](float cx, int n) {
+            const int c = (int)v.size() / 3;
+            v.insert(v.end(), {cx, 0.f, 0.f});
+            for (int i = 0; i < n; ++i) {
+                const float ang = 6.2831853f * (float)i / (float)n;
+                v.push_back(cx);
+                v.push_back(0.02f * std::sin(ang));
+                v.push_back(((i % 2) ? 0.08f : -0.02f));
+            }
+            for (int i = 0; i < n; ++i) {
+                f.push_back(c);
+                f.push_back(c + 1 + i);
+                f.push_back(c + 1 + (i + 1) % n);
+            }
+        };
+        const int npart = 80;   // 80/3200 = 2.5%
+        add_fan(0.4f + 0.5f * voxel, npart);
+        add_fan(1.5f, npart);
+        std::printf("post-pass consistency: body=%d part=%d (%.2f%%)\n", body, npart, 100.0 * npart / body);
+        trellis::drop_pre_decimation_components(v, f, voxel);
+        const int mid = (int)f.size() / 3;
+        float xmax = -1e9f, xmin = 1e9f;
+        for (size_t i = 0; i < v.size(); i += 3) {
+            xmax = std::max(xmax, v[i]);
+            xmin = std::min(xmin, v[i]);
+        }
+        if (!(xmax > 0.40f && xmax < 0.6f))
+            rc |= fail("consistency: attached 2.5% part was dropped on the first pass");
+        if (xmax > 1.0f)
+            rc |= fail("consistency: detached 2.5% shell survived the first pass");
+        trellis::drop_pre_decimation_components(v, f, voxel);
+        if ((int)f.size() / 3 != mid)
+            rc |= fail("consistency: second pass removed the against-body part");
+        if (!(xmin > -0.5f))
+            rc |= fail("consistency: unexpected geometry");
+        std::printf("post-pass consistency: faces %d -> %d -> %d xmax=%.3f\n", body + 2 * npart, mid, (int)f.size() / 3, xmax);
+    }
+
+    // Large-mesh timing. Dust under 2% must not enter the gap search.
+    // Also times the old per-vertex ring walk on a slice of the far shell so
+    // the speedup is measured, not just the new absolute time.
+    {
+        std::vector<float> v;
+        std::vector<int32_t> f;
+        add_grid(v, f, 420);                 // 352800 body faces
+        const int body = (int)f.size() / 3;
+        const float voxel = 0.01f;
+        const double cell = 3.0 * voxel;
+        auto add_fan = [&](float cx, float cy, int n) {
+            const int c = (int)v.size() / 3;
+            v.insert(v.end(), {cx, cy, 0.f});
+            for (int i = 0; i < n; ++i) {
+                const float ang = 6.2831853f * (float)i / (float)n;
+                v.push_back(cx);
+                v.push_back(cy + 0.01f * std::sin(ang));
+                v.push_back((i % 2) ? 0.05f : -0.01f);
+            }
+            for (int i = 0; i < n; ++i) {
+                f.push_back(c);
+                f.push_back(c + 1 + i);
+                f.push_back(c + 1 + (i + 1) % n);
+            }
+        };
+        const int band = std::max(2, (int)(0.025f * body));
+        const int shell_base = (int)v.size() / 3;
+        add_fan(1.6f, 0.f, band);
+        const int shell_verts = (int)v.size() / 3 - shell_base;
+        add_fan(0.4f + 0.5f * voxel, 0.f, band);
+        for (int i = 0; i < 2000; ++i) add_fan(3.f + 0.01f * (i % 50), 3.f + 0.01f * (i / 50), 1);
+
+        // Old search: expand coarse rings per shell vertex until a body sample is found.
+        std::unordered_map<uint64_t, int> rep;
+        auto pack = [](int x, int y, int z) {
+            return (uint64_t)(uint32_t)(x + 0x100000) << 42 |
+                   (uint64_t)(uint32_t)(y + 0x100000) << 21 |
+                   (uint32_t)(z + 0x100000);
+        };
+        const double coarse = 8.0 * voxel;
+        for (int i = 0; i < shell_base; ++i) {
+            const float* p = v.data() + 3 * i;
+            const int x = (int)std::floor(p[0] / coarse);
+            const int y = (int)std::floor(p[1] / coarse);
+            const int z = (int)std::floor(p[2] / coarse);
+            rep.emplace(pack(x, y, z), i);
+        }
+        const int sample = std::min(shell_verts, 400);
+        const auto t_old0 = std::chrono::steady_clock::now();
+        for (int s = 0; s < sample; ++s) {
+            const float* p = v.data() + 3 * (shell_base + 1 + s);
+            const int cx = (int)std::floor(p[0] / coarse);
+            const int cy = (int)std::floor(p[1] / coarse);
+            const int cz = (int)std::floor(p[2] / coarse);
+            for (int R = 0; R < 24; ++R) {
+                bool hit = false;
+                for (int dz = -R; dz <= R && !hit; ++dz)
+                    for (int dy = -R; dy <= R && !hit; ++dy)
+                        for (int dx = -R; dx <= R; ++dx) {
+                            if (R && std::max(std::abs(dx), std::max(std::abs(dy), std::abs(dz))) != R) continue;
+                            if (rep.find(pack(cx + dx, cy + dy, cz + dz)) != rep.end()) { hit = true; break; }
+                        }
+                if (hit) break;
+            }
+        }
+        const double old_sample = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_old0).count();
+        const double old_shell = old_sample * (double)shell_verts / (double)sample;
+        const auto t0 = std::chrono::steady_clock::now();
+        trellis::drop_pre_decimation_components(v, f, voxel);
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("bench: body=%d shell_verts=%d dust=2000  new_filter %.3fs  "
+                    "old_ring %.3fs/%d verts (%.1fs extrapolated to this shell)\n",
+                    body, shell_verts, dt, old_sample, sample, old_shell);
+        (void)cell;
+        if (dt > 15.0)
+            rc |= fail("component filter slower than 15s on the synthetic large mesh");
+        float xmax = -1e9f;
+        for (size_t i = 0; i < v.size(); i += 3) xmax = std::max(xmax, v[i]);
+        if (!(xmax > 0.40f && xmax < 0.6f))
+            rc |= fail("bench: attached part or detached shell decision changed");
     }
 
     if (rc == 0) std::printf("ok\n");

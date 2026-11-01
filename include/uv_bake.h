@@ -58,9 +58,9 @@ void decimate_qem(const std::vector<float>& verts, int V, const std::vector<int3
 // shatter our mesh into 50+ pieces) while keeping legitimately large secondary shells
 // (a hollow vase's inner+outer surface). In place; returns the number of components dropped.
 //
-// Face share is not stable across QEM. The pre-decimation pass is
-// drop_pre_decimation_components; this face-count cut still runs after QEM
-// (3%) to drop flats that collapse to a handful of triangles.
+// Face-count-only cut. The pre- and post-QEM passes both use
+// drop_pre_decimation_components so a part kept as against the body is not
+// removed afterwards just because its share is still under 3%.
 int drop_small_components(std::vector<float>& verts, std::vector<int32_t>& faces, float frac = 0.02f);
 
 // World length of one remesh cell. Matches remesh_narrow_band_dc: output
@@ -83,8 +83,11 @@ constexpr float kPreDecimAttachVoxels = 3.f;
 // - face share < 3% and gap > kPreDecimAttachVoxels: dropped
 // - face share >= 3% (feet at ~3.9%): kept even when detached
 // - face share in [2%, 3%) and within the attach distance: kept
-// `voxel_world` is remesh_voxel_world(res, band). Logs every drop with face
-// share and gap, and every keep in the [2%, 3%) band. Returns components dropped.
+// `voxel_world` is remesh_voxel_world(res, band). Logs every 2–3% decision
+// with face share and gap, and summarizes pieces under 2% (those are dropped
+// with no gap search). Prints
+// `remesh postproc: components took X s (gap search Y s)`.
+// Returns components dropped. Safe to run again after QEM: same rules.
 int drop_pre_decimation_components(std::vector<float>& verts, std::vector<int32_t>& faces,
                                    float voxel_world);
 
