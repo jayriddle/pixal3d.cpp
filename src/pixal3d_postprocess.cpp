@@ -57,7 +57,7 @@ bool pixal3d_write_production_glb(const std::string& out_glb, Mesh mesh,
     Mesh rm = remesh_narrow_band_dc(mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(), bvh, rres, opt.remesh_band);
     if (rm.F() > 0) {
         clean_mesh(rm.V(), rm.faces);
-        int ndrop = drop_small_components(rm.verts, rm.faces, 0.03f);
+        int ndrop = drop_small_components(rm.verts, rm.faces, 0.02f);
         plog(os, "postprocess: remesh done V=%d F=%d dropped=%d", rm.V(), rm.F(), ndrop);
     } else plog(os, "postprocess: remesh empty, using decoded mesh");
 

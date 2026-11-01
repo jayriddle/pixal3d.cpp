@@ -59,10 +59,9 @@ void decimate_qem(const std::vector<float>& verts, int V, const std::vector<int3
 // (a hollow vase's inner+outer surface). In place; returns the number of components dropped.
 //
 // Face share is not stable across QEM: a smooth body loses far more triangles than a
-// spiky shell, so a shell that is under `frac` before simplification can land over it
-// after. Callers that decimate must apply this cut to the pre-decimation mesh (the
-// same mesh the historical 1,000,000-face target left untouched). A second pass after
-// QEM still catches flats that collapse to a handful of triangles (a ground slab).
+// spiky shell, so a shell under `frac` before simplification can land over it after.
+// The pipeline therefore runs this on the pre-decimation mesh (2%) and again after
+// QEM (3%, which drops flats that collapse to a handful of triangles).
 int drop_small_components(std::vector<float>& verts, std::vector<int32_t>& faces, float frac = 0.02f);
 
 // xatlas PackOptions::padding, in packer pixels. Full gutter when the atlas has

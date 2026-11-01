@@ -315,17 +315,15 @@ int main() {
         }
     }
 
-    // Floater: one spiky shell whose face share is between the old 2% pre-pass
-    // and the 3% post-pass. QEM collapses the smooth body harder than the shell,
-    // so a post-only 3% cut keeps the shell. Deciding 3% before QEM removes it.
-    // A flat slab that is a large face share before QEM and a tiny one after is
-    // still removed by the post-pass. A second body at ~40% survives both.
+    // Restored pipeline: 2% on the dense mesh, QEM, then 3% on the result.
+    // A shell between 2% and 3% of the body is kept (that band is real parts).
+    // Dust under 2% is dropped before QEM. A flat slab that is large before
+    // QEM and tiny after is dropped by the post-pass. A second body survives.
     {
         std::vector<float> v;
         std::vector<int32_t> f;
         add_grid(v, f, 56);                       // smooth body, 6272 faces, around the origin
         const int body_faces = (int)f.size() / 3;
-        const float body_max_x = 0.4f;
         // Spiky fan, one component, ~2.5% of the body, parked out at x=1.2 so it
         // inflates the bounding box when it survives.
         {
@@ -347,6 +345,24 @@ int main() {
             }
         }
         const int floater_faces = 160;
+        // Dust under 2% of the body, farther out at x=2. The pre-pass drops it.
+        const int dust_faces = 40;
+        {
+            const int c = (int)v.size() / 3;
+            const float cx = 2.0f;
+            v.insert(v.end(), {cx, 0.f, 0.f});
+            for (int i = 0; i < dust_faces; ++i) {
+                const float ang = 6.2831853f * (float)i / (float)dust_faces;
+                v.push_back(cx + 0.02f * std::cos(ang));
+                v.push_back(0.02f * std::sin(ang));
+                v.push_back((i % 2) ? 0.05f : -0.02f);
+            }
+            for (int i = 0; i < dust_faces; ++i) {
+                f.push_back(c);
+                f.push_back(c + 1 + i);
+                f.push_back(c + 1 + (i + 1) % dust_faces);
+            }
+        }
         // Flat slab, ~25% of the body, at y=-1. QEM reduces it to a few triangles.
         {
             const int n = 28;
@@ -403,56 +419,43 @@ int main() {
         const auto before = comp_sizes(v, f);
         std::printf("floater before: components");
         for (int s : before) std::printf(" %d", s);
-        std::printf(" (body %d, floater %d = %.2f%% of body)\n",
-                    body_faces, floater_faces, 100.0 * floater_faces / body_faces);
+        std::printf(" (body %d, shell %d = %.2f%%, dust %d = %.2f%%)\n",
+                    body_faces, floater_faces, 100.0 * floater_faces / body_faces,
+                    dust_faces, 100.0 * dust_faces / body_faces);
 
-        // Old policy: 2% on the dense mesh, QEM, 3% on the result. The shell survives.
+        // 2% before QEM, 3% after. Dust goes. The 2–3% shell stays. The slab
+        // collapses and the post-pass removes it. The second body stays.
         {
             std::vector<float> a = v;
             std::vector<int32_t> b = f;
-            trellis::drop_small_components(a, b, 0.02f);
+            const int dropped = trellis::drop_small_components(a, b, 0.02f);
+            const float xmax_pre = bbox_max_x(a);
             std::vector<float> ov;
             std::vector<int32_t> of;
             trellis::decimate_qem(a, (int)a.size() / 3, b, (int)b.size() / 3, 900, ov, of);
             const auto mid = comp_sizes(ov, of);
-            std::printf("floater after QEM@900 (2%% pre):");
+            std::printf("floater after QEM@900 (2%% pre, dropped=%d, xmax_pre=%.3f):", dropped, xmax_pre);
             for (int s : mid) std::printf(" %d", s);
-            std::printf("  bbox_max_x=%.3f\n", bbox_max_x(ov));
-            trellis::drop_small_components(ov, of, 0.03f);
-            const auto after = comp_sizes(ov, of);
-            std::printf("floater after post 3%%:");
-            for (int s : after) std::printf(" %d", s);
-            std::printf("  bbox_max_x=%.3f\n", bbox_max_x(ov));
-            if (bbox_max_x(ov) < 0.8f)
-                rc |= fail("synthetic shell was already removed by the old 2%%/post-3%% policy; test no longer shows the regression");
-        }
-        // New policy: 3% before QEM, then 3% after.
-        {
-            std::vector<float> a = v;
-            std::vector<int32_t> b = f;
-            const int dropped = trellis::drop_small_components(a, b, 0.03f);
-            std::vector<float> ov;
-            std::vector<int32_t> of;
-            trellis::decimate_qem(a, (int)a.size() / 3, b, (int)b.size() / 3, 900, ov, of);
+            std::printf("\n");
             trellis::drop_small_components(ov, of, 0.03f);
             const auto after = comp_sizes(ov, of);
             const float xmax = bbox_max_x(ov);
             float ymin = 1e9f;
             for (size_t i = 1; i < ov.size(); i += 3) ymin = std::min(ymin, ov[i]);
-            std::printf("floater new policy: dropped_pre=%d  components", dropped);
+            std::printf("floater after post 3%%:");
             for (int s : after) std::printf(" %d", s);
             std::printf("  bbox_max_x=%.3f ymin=%.3f\n", xmax, ymin);
-            if (xmax > body_max_x + 0.05f)
-                rc |= fail("spiky floater still inflates the bounding box");
+            if (xmax_pre > 1.6f)
+                rc |= fail("dust under 2% survived the pre-decimation cut");
+            if (xmax < 0.8f)
+                rc |= fail("2-3% shell was dropped; the 2% cutoff should keep it");
+            if (xmax > 1.6f)
+                rc |= fail("dust survived QEM");
             if (ymin < -0.8f)
                 rc |= fail("flat slab survived the post-QEM face-count cut");
-            if (after.size() < 2)
-                rc |= fail("secondary body was dropped with the floater");
-            if (after.size() > 2)
-                rc |= fail("flat slab or floater survived both 3% cuts");
-            // Largest is the original body (or what QEM left of it); the secondary
-            // grid started at 36^2*2 = 2592 faces and must still be present.
-            if (after[0] < 200)
+            if (after.size() != 3)
+                rc |= fail("expected body + secondary + 2-3% shell after both cuts");
+            if (after.empty() || after[0] < 200)
                 rc |= fail("main body collapsed below the QEM target's useful range");
         }
     }
