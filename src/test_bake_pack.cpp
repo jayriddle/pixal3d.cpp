@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -258,6 +259,202 @@ int main() {
         trellis::decimate_qem(v, (int)v.size() / 3, f, Fin, target, ov, of);
         std::printf("coverage decimate: faces %d -> %d (target %d)\n", Fin, (int)of.size() / 3, target);
         coverage("qem", ov, of);
+    }
+
+    // Padding policy: full gutter at the measured 213k/1024 bake, none at the
+    // historical 1M/1024 pack (padding 0). A fixed pad of 4 there inflated the
+    // packer and the downscale threw texels away.
+    {
+        const uint32_t full = trellis::xatlas_pack_padding(1024, 1);
+        const uint32_t at_213k = trellis::xatlas_pack_padding(1024, 212818);
+        const uint32_t at_250k = trellis::xatlas_pack_padding(1024, 250000);
+        const uint32_t at_1m = trellis::xatlas_pack_padding(1024, 1000000);
+        const uint32_t at_820k = trellis::xatlas_pack_padding(1024, 820534);
+        const uint32_t at_300k = trellis::xatlas_pack_padding(2048, 300000);
+        std::printf("padding: full@1024=%u  213k=%u  250k=%u  820k=%u  1M=%u  trellis 300k@2048=%u\n",
+                    full, at_213k, at_250k, at_820k, at_1m, at_300k);
+        if (at_213k != full || at_250k != full)
+            rc |= fail("250k/1024 should keep the full gutter (the measured bake)");
+        if (at_1m != 0 || at_820k != 0)
+            rc |= fail("1M and the undecimated 820k mesh should pack with padding 0");
+        if (at_300k != trellis::xatlas_pack_padding(2048, 1))
+            rc |= fail("TRELLIS 300k/2048 should keep a full gutter");
+    }
+
+    // Chart-heavy mesh with fewer atlas texels than faces. Padding must be 0
+    // (the historical pack) and UVs must still land in the bake atlas.
+    {
+        const int nq = 24;          // 1152 faces
+        const int T = 32;           // 1024 texels → < 1 texel/face
+        std::vector<float> hv;
+        std::vector<int32_t> hf;
+        for (int gy = 0; gy < nq; ++gy) {
+            for (int gx = 0; gx < nq; ++gx) {
+                const float x0 = -0.45f + gx * (0.9f / nq);
+                const float y0 = -0.45f + gy * (0.9f / nq);
+                const float s = 0.55f * (0.9f / nq);
+                const int b = (int)hv.size() / 3;
+                hv.insert(hv.end(), {x0, y0, 0.f, x0 + s, y0, 0.f, x0 + s, y0 + s, 0.f, x0, y0 + s, 0.f});
+                hf.insert(hf.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
+            }
+        }
+        const int faces = (int)hf.size() / 3;
+        const uint32_t expect = trellis::xatlas_pack_padding(T, faces);
+        std::printf("dense charts: faces=%d atlas=%d expected padding=%u (%.2f atlas texels/face)\n",
+                    faces, T, expect, (double)T * T / faces);
+        if (expect != 0) rc |= fail("chart-heavy mesh should pack with padding 0");
+        const std::vector<float> no;
+        trellis::BakedMesh bm = trellis::uv_bake(hv, (int)hv.size() / 3, hf, faces, no, T, nullptr);
+        if (!bm.ok()) rc |= fail("dense-chart bake failed");
+        else {
+            float umin = 1e9f, umax = -1e9f;
+            for (float u : bm.uv) { umin = std::min(umin, u); umax = std::max(umax, u); }
+            std::printf("dense charts: uv=[%.4f, %.4f] faces_out=%zu\n", umin, umax, bm.faces.size() / 3);
+            if (umin < -0.02f || umax > 1.02f)
+                rc |= fail("dense-chart UVs fell outside the atlas");
+        }
+    }
+
+    // Floater: one spiky shell whose face share is between the old 2% pre-pass
+    // and the 3% post-pass. QEM collapses the smooth body harder than the shell,
+    // so a post-only 3% cut keeps the shell. Deciding 3% before QEM removes it.
+    // A flat slab that is a large face share before QEM and a tiny one after is
+    // still removed by the post-pass. A second body at ~40% survives both.
+    {
+        std::vector<float> v;
+        std::vector<int32_t> f;
+        add_grid(v, f, 56);                       // smooth body, 6272 faces, around the origin
+        const int body_faces = (int)f.size() / 3;
+        const float body_max_x = 0.4f;
+        // Spiky fan, one component, ~2.5% of the body, parked out at x=1.2 so it
+        // inflates the bounding box when it survives.
+        {
+            const int n = 160;
+            const int c = (int)v.size() / 3;
+            const float cx = 1.2f, cy = 0.f, cz = 0.f;
+            v.insert(v.end(), {cx, cy, cz});
+            for (int i = 0; i < n; ++i) {
+                const float ang = 6.2831853f * (float)i / (float)n;
+                const float spike = (i % 2) ? 0.18f : -0.04f;
+                v.push_back(cx + 0.05f * std::cos(ang));
+                v.push_back(cy + 0.05f * std::sin(ang));
+                v.push_back(cz + spike);
+            }
+            for (int i = 0; i < n; ++i) {
+                f.push_back(c);
+                f.push_back(c + 1 + i);
+                f.push_back(c + 1 + (i + 1) % n);
+            }
+        }
+        const int floater_faces = 160;
+        // Flat slab, ~25% of the body, at y=-1. QEM reduces it to a few triangles.
+        {
+            const int n = 28;
+            const int base = (int)v.size() / 3;
+            for (int y = 0; y <= n; ++y)
+                for (int x = 0; x <= n; ++x) {
+                    v.push_back(-0.2f + 0.4f * (float)x / (float)n);
+                    v.push_back(-1.2f + 0.02f * (float)y / (float)n);
+                    v.push_back(0.f);
+                }
+            auto id = [n, base](int x, int y) { return base + y * (n + 1) + x; };
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x < n; ++x) {
+                    const int a = id(x, y), b = id(x + 1, y), c = id(x + 1, y + 1), d = id(x, y + 1);
+                    f.insert(f.end(), {a, b, c, a, c, d});
+                }
+        }
+        // Second smooth body, large enough to survive both cuts.
+        {
+            std::vector<float> v2;
+            std::vector<int32_t> f2;
+            add_grid(v2, f2, 36);
+            const int base = (int)v.size() / 3;
+            for (size_t i = 0; i < v2.size(); i += 3) {
+                v.push_back(v2[i]);
+                v.push_back(v2[i + 1] + 1.5f);
+                v.push_back(v2[i + 2]);
+            }
+            for (int idx : f2) f.push_back(base + idx);
+        }
+        auto comp_sizes = [](const std::vector<float>& vv, const std::vector<int32_t>& ff) {
+            const int V = (int)vv.size() / 3;
+            std::vector<int> par((size_t)V);
+            for (int i = 0; i < V; ++i) par[i] = i;
+            auto find = [&](int x) { while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+            for (size_t i = 0; i < ff.size(); i += 3) {
+                int r0 = find(ff[i]), r1 = find(ff[i + 1]), r2 = find(ff[i + 2]);
+                if (r0 != r1) par[r1] = r0;
+                r0 = find(ff[i]);
+                if (r0 != r2) par[r2] = r0;
+            }
+            std::unordered_map<int, int> fc;
+            for (size_t i = 0; i < ff.size(); i += 3) fc[find(ff[i])]++;
+            std::vector<int> sizes;
+            for (auto& kv : fc) sizes.push_back(kv.second);
+            std::sort(sizes.begin(), sizes.end(), std::greater<int>());
+            return sizes;
+        };
+        auto bbox_max_x = [](const std::vector<float>& vv) {
+            float m = -1e9f;
+            for (size_t i = 0; i < vv.size(); i += 3) m = std::max(m, vv[i]);
+            return m;
+        };
+        const auto before = comp_sizes(v, f);
+        std::printf("floater before: components");
+        for (int s : before) std::printf(" %d", s);
+        std::printf(" (body %d, floater %d = %.2f%% of body)\n",
+                    body_faces, floater_faces, 100.0 * floater_faces / body_faces);
+
+        // Old policy: 2% on the dense mesh, QEM, 3% on the result. The shell survives.
+        {
+            std::vector<float> a = v;
+            std::vector<int32_t> b = f;
+            trellis::drop_small_components(a, b, 0.02f);
+            std::vector<float> ov;
+            std::vector<int32_t> of;
+            trellis::decimate_qem(a, (int)a.size() / 3, b, (int)b.size() / 3, 900, ov, of);
+            const auto mid = comp_sizes(ov, of);
+            std::printf("floater after QEM@900 (2%% pre):");
+            for (int s : mid) std::printf(" %d", s);
+            std::printf("  bbox_max_x=%.3f\n", bbox_max_x(ov));
+            trellis::drop_small_components(ov, of, 0.03f);
+            const auto after = comp_sizes(ov, of);
+            std::printf("floater after post 3%%:");
+            for (int s : after) std::printf(" %d", s);
+            std::printf("  bbox_max_x=%.3f\n", bbox_max_x(ov));
+            if (bbox_max_x(ov) < 0.8f)
+                rc |= fail("synthetic shell was already removed by the old 2%%/post-3%% policy; test no longer shows the regression");
+        }
+        // New policy: 3% before QEM, then 3% after.
+        {
+            std::vector<float> a = v;
+            std::vector<int32_t> b = f;
+            const int dropped = trellis::drop_small_components(a, b, 0.03f);
+            std::vector<float> ov;
+            std::vector<int32_t> of;
+            trellis::decimate_qem(a, (int)a.size() / 3, b, (int)b.size() / 3, 900, ov, of);
+            trellis::drop_small_components(ov, of, 0.03f);
+            const auto after = comp_sizes(ov, of);
+            const float xmax = bbox_max_x(ov);
+            float ymin = 1e9f;
+            for (size_t i = 1; i < ov.size(); i += 3) ymin = std::min(ymin, ov[i]);
+            std::printf("floater new policy: dropped_pre=%d  components", dropped);
+            for (int s : after) std::printf(" %d", s);
+            std::printf("  bbox_max_x=%.3f ymin=%.3f\n", xmax, ymin);
+            if (xmax > body_max_x + 0.05f)
+                rc |= fail("spiky floater still inflates the bounding box");
+            if (ymin < -0.8f)
+                rc |= fail("flat slab survived the post-QEM face-count cut");
+            if (after.size() < 2)
+                rc |= fail("secondary body was dropped with the floater");
+            if (after.size() > 2)
+                rc |= fail("flat slab or floater survived both 3% cuts");
+            // Largest is the original body (or what QEM left of it); the secondary
+            // grid started at 36^2*2 = 2592 faces and must still be present.
+            if (after[0] < 200)
+                rc |= fail("main body collapsed below the QEM target's useful range");
+        }
     }
 
     if (rc == 0) std::printf("ok\n");

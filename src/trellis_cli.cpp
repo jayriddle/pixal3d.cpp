@@ -542,7 +542,7 @@ int trellis_run_mv(const trellis::TrellisParams& cfg) {
         // default), not TRELLIS.2's res/512 auto-scale -- unless the user passes --band.
         const int dband = cfg.band > 0 ? cfg.band : 1;
         trellis::Mesh rm = trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(), dbvh, so.res, dband);
-        if (rm.F() > 0) { trellis::clean_mesh(rm.V(), rm.faces); trellis::drop_small_components(rm.verts, rm.faces, 0.02f); }
+        if (rm.F() > 0) { trellis::clean_mesh(rm.V(), rm.faces); trellis::drop_small_components(rm.verts, rm.faces, 0.03f); }
         const std::vector<float>& dverts = rm.F() > 0 ? rm.verts : mesh.verts;
         const std::vector<int32_t>& dfaces = rm.F() > 0 ? rm.faces : mesh.faces;
         FILE* dfp = fopen(cfg.dump_post.c_str(), "wb");
@@ -576,7 +576,14 @@ int trellis_run_mv(const trellis::TrellisParams& cfg) {
         trellis::Mesh rm = trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(), bvh, so.res, remesh_band);
         if (rm.F() > 0) {
             trellis::clean_mesh(rm.V(), rm.faces);
-            int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.02f);
+            // 3%, not 2%: this is the same cut the post-QEM pass uses. It has to
+            // run on the dense mesh. QEM collapses a smooth body much harder than
+            // a spiky shell, so a shell that is 2–3% of the body's faces here
+            // (removed when the 1,000,000 target makes QEM a no-op) crosses 3%
+            // after a 250k simplify and the post-pass keeps it. The post-pass
+            // still runs, for flats that only become a small face share once
+            // they collapse.
+            int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.03f);
             printf("  remesh postproc: dropped %d floater comps -> V=%d F=%d\n", ndrop, rm.V(), rm.F());
         }
         const std::vector<float>& sverts = rm.F() > 0 ? rm.verts : mesh.verts;
@@ -1006,7 +1013,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                                                           dbvh, so.res, dband);
         if (rm.F() > 0) {
             trellis::clean_mesh(rm.V(), rm.faces);
-            trellis::drop_small_components(rm.verts, rm.faces, 0.02f);
+            trellis::drop_small_components(rm.verts, rm.faces, 0.03f);
         }
         const std::vector<float>&   dverts = rm.F() > 0 ? rm.verts : mesh.verts;
         const std::vector<int32_t>& dfaces = rm.F() > 0 ? rm.faces : mesh.faces;
@@ -1077,7 +1084,9 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // which keeps the mesh aligned to the voxel PBR volume for correct texture sampling).
         if (rm.F() > 0) {
             trellis::clean_mesh(rm.V(), rm.faces);
-            int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.02f);
+            // Same 3% pre-QEM cut as the Pixal path: face share is not stable
+            // across simplification (see the comment there).
+            int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.03f);
             printf("  remesh postproc: dropped %d floater comps -> V=%d F=%d\n", ndrop, rm.V(), rm.F());
             fflush(stdout);
         }

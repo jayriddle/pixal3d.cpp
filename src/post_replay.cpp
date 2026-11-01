@@ -130,7 +130,10 @@ int main(int argc, char** argv) {
         if (rm.F() > 0) {
             trellis::clean_mesh(rm.V(), rm.faces);
             audit("clean_mesh", rm.faces);
-            int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.02f);
+            // 3% on the pre-QEM mesh, matching the CLI. A 2% cut lets a spiky
+            // shell through; QEM then shrinks the smooth body harder, and the
+            // shell's face share crosses the post-pass 3% line.
+            int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.03f);
             printf("  [clean+drop %.1fs] dropped=%d\n", now()-t, ndrop); t = now();
             audit("drop_components", rm.faces);
         }

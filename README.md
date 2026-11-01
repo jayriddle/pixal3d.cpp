@@ -248,17 +248,14 @@ additionally fuse in NAF high-resolution image features. See `docs/spec/30-pixal
 the full conditioning spec. UV atlas (4096px) and remesh band (1) default to the
 reference pipeline's values in this mode (`--atlas` / `--band` override them). The pre-bake
 quadric target defaults to **250000** faces (`--faces N` overrides it; the TRELLIS.2 path keeps
-300000 on the cascade and 150000 at `--res 512`). That budget is sized for a 1024 atlas — about
-four texels of atlas per face before packing loss — because the reference 1,000,000 target sits
-above a typical Pixal remesh and the quadric pass was not reducing the mesh. `--decim` selects
-the legacy cluster grid and ignores `--faces`. Everything after SLAT sampling
+300000 on the cascade and 150000 at `--res 512`). On a real Pixal `--atlas 1024` bake (about 213k faces) that
+lands at **2.16 texels per face** and a **~6.1 px** chart gutter. The reference 1,000,000
+target sits above a typical Pixal remesh, so the quadric pass was not reducing the mesh.
+`--decim` selects the legacy cluster grid and ignores `--faces`. Everything after SLAT sampling
 (decode/remesh/decimate/UV/bake/GLB export) is the same TRELLIS.2 postprocess code. xatlas
-charts are packed with a gutter (`PackOptions::padding`, 4 px in the packer's ~1024 space
-at bake sizes of 1024 and up). UVs are still divided by the packer's width and height, so
-that gutter scales into the bake atlas — about 8 px at 1024 when the packer fills its
-estimate, 16 px at 2048, 32 px at 4096. The bake log prints the realized width
-(`bake gutter ~N px`). The gap keeps the radius-3 Telea inpaint from averaging colour
-across a neighbouring chart.
+charts are packed with a gutter that fades out when the mesh is already dense for the atlas
+(a fixed pad on a 1,000,000-face 1024 bake inflated the packer and cut texels per face below
+the old padding-0 result). The bake log prints the realized width (`bake gutter ~N px`).
 
 ## Pipeline
 

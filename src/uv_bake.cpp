@@ -237,26 +237,27 @@ void telea_inpaint(std::vector<uint8_t>& base, std::vector<uint8_t>& mr,
     }
 }
 
-// Packer-pixel gutter for xatlas. resolution stays 0: xatlas then builds one
-// atlas aimed at ~1024 (a non-zero resolution turns on multi-atlas packing,
-// which this baker does not composite). Chart UVs and the returned width/height
-// are both in that packer pixel space — xatlas already shifts UVs by -padding
-// and trims the outer margin — and uv_bake normalizes by width/height into the
-// bake atlas. A packer padding of P therefore becomes about 2P * texsize/1024
-// bake pixels between chart contents, so the gutter scales with the atlas.
-//
-// The target gap is max(8, texsize/128) bake pixels: 8 px at 1024 (wider than
-// the radius-3 Telea window, so the fill dilates each chart into its own gutter
-// instead of averaging a neighbour), 16 px at 2048, 32 px at 4096. Below 1024
-// the packer is still ~1024 and the normalization scales the gutter down, so P
-// grows to hold the 8 px floor.
-uint32_t xatlas_pack_padding(int texsize) {
-    if (texsize < 1) texsize = 1;
-    const int gutter = std::max(8, texsize / 128);
-    const int pad = (gutter * 512 + texsize - 1) / texsize;   // ceil(gutter * 1024 / (2 * texsize))
-    return (uint32_t)std::max(2, std::min(pad, 64));
-}
 }  // namespace
+
+uint32_t xatlas_pack_padding(int texsize, int faces) {
+    if (texsize < 1) texsize = 1;
+    if (faces < 1) faces = 1;
+    // Bake-pixel gutter we'd like when the packer hits its ~1024 estimate:
+    // max(8, texsize/128). xatlas padding is in packer pixels and the gap
+    // between chart contents is ~2*padding, mapped by texsize/packer_width.
+    // padding = gutter * 1024 / (2 * texsize) realizes that when the packer
+    // width is ~1024. A real 1024 bake of ~213k faces measured ~6.1 px, because
+    // the packer atlas landed a bit over 1024.
+    const int gutter = std::max(8, texsize / 128);
+    const int full = std::max(2, std::min(64, (gutter * 512 + texsize - 1) / texsize));
+    // Room in the atlas. >= ~4 texels/face (250k on 1024 is 4.2) keeps the full
+    // gutter. At ~1 texel/face (1,000,000 on 1024) padding goes to 0: a fixed
+    // padding of 4 there grew the packer to ~2338 px and the downscale into
+    // 1024 left ~0.19 texels/face, against ~0.77 with padding 0.
+    const double tpf = (double)texsize * (double)texsize / (double)faces;
+    const double room = std::min(1.0, std::max(0.0, (tpf - 1.0) / 3.0));
+    return (uint32_t)std::max(0, std::min(64, (int)std::lround((double)full * room)));
+}
 
 void decimate_cluster(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
                       const std::vector<float>& pbr6, int grid,
@@ -804,9 +805,12 @@ BakedMesh uv_chart_project(const std::vector<float>& verts, int V, const std::ve
 
     // shelf packing: global scale found by bisection so everything fits with padding.
     // The slot is content + 2*pad and the chart origin is inset by pad, so the
-    // content-to-content gutter is 2*pad bake pixels. Same floor-and-scale as
-    // the xatlas packer: 8 px at 1024, 16 px at 2048, 32 px at 4096.
-    const int pad = std::max(4, texsize / 256);
+    // content-to-content gutter is 2*pad bake pixels. The width tracks the
+    // xatlas gutter (and fades the same way when the mesh is dense for the atlas).
+    const uint32_t pack_full = xatlas_pack_padding(texsize, 1);
+    const uint32_t pack_pad = xatlas_pack_padding(texsize, F);
+    const float pack_room = pack_full ? (float)pack_pad / (float)pack_full : 0.f;
+    const int pad = std::max(0, (int)std::lround(std::max(4, texsize / 256) * pack_room));
     std::vector<int> order(cs.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = (int)i;
     float total = 0;
@@ -1228,10 +1232,19 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
     // charts. Density still comes from that normalization, not from packing
     // at the bake resolution.
     xatlas::PackOptions po;
-    po.padding = xatlas_pack_padding(texsize);
+    const int packed_faces = (int)big_faces.size();
+    const uint32_t full_pad = xatlas_pack_padding(texsize, 1);
+    po.padding = xatlas_pack_padding(texsize, packed_faces);
     po.resolution = 0;
     po.bilinear = true;
     po.blockAlign = false;
+    if (po.padding < full_pad) {
+        const double tpf = (double)texsize * (double)texsize / (double)std::max(packed_faces, 1);
+        fprintf(stderr,
+                "  uv_bake: %d faces in a %d atlas (%.2f atlas texels/face); "
+                "pack padding %u (a full gutter of %u would inflate the packer and shrink the charts)\n",
+                packed_faces, texsize, tpf, po.padding, full_pad);
+    }
     xatlas::PackCharts(atlas, po);
     if (atlas->meshCount == 0 || atlas->width == 0) { xatlas::Destroy(atlas); return out; }
 
