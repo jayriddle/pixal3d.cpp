@@ -130,9 +130,8 @@ int main(int argc, char** argv) {
         if (rm.F() > 0) {
             trellis::clean_mesh(rm.V(), rm.faces);
             audit("clean_mesh", rm.faces);
-            // 2% on the pre-QEM mesh, matching the CLI. The 3% pass after QEM
-            // still drops flats that collapse to a small face share.
-            int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.02f);
+            const float voxel = trellis::remesh_voxel_world(res, band);
+            int ndrop = trellis::drop_pre_decimation_components(rm.verts, rm.faces, voxel);
             printf("  [clean+drop %.1fs] dropped=%d\n", now()-t, ndrop); t = now();
             audit("drop_components", rm.faces);
         }

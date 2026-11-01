@@ -315,54 +315,41 @@ int main() {
         }
     }
 
-    // Restored pipeline: 2% on the dense mesh, QEM, then 3% on the result.
-    // A shell between 2% and 3% of the body is kept (that band is real parts).
-    // Dust under 2% is dropped before QEM. A flat slab that is large before
-    // QEM and tiny after is dropped by the post-pass. A second body survives.
+    // Pre-decimation: 2% always; under 3% only when farther than 3 remesh
+    // voxels from the body. An attached 2.5% part stays, a detached 2.5%
+    // shell goes, a far 4% foot stays. Post-QEM 3% still drops a flat slab.
     {
+        const float voxel = 0.01f;
         std::vector<float> v;
         std::vector<int32_t> f;
-        add_grid(v, f, 56);                       // smooth body, 6272 faces, around the origin
+        add_grid(v, f, 56);                       // smooth body, 6272 faces, x in [-0.4, 0.4]
         const int body_faces = (int)f.size() / 3;
-        // Spiky fan, one component, ~2.5% of the body, parked out at x=1.2 so it
-        // inflates the bounding box when it survives.
-        {
-            const int n = 160;
+        auto add_fan = [&](float cx, float cy, float cz, int n, float radius, float spike) {
             const int c = (int)v.size() / 3;
-            const float cx = 1.2f, cy = 0.f, cz = 0.f;
             v.insert(v.end(), {cx, cy, cz});
             for (int i = 0; i < n; ++i) {
                 const float ang = 6.2831853f * (float)i / (float)n;
-                const float spike = (i % 2) ? 0.18f : -0.04f;
-                v.push_back(cx + 0.05f * std::cos(ang));
-                v.push_back(cy + 0.05f * std::sin(ang));
-                v.push_back(cz + spike);
+                v.push_back(cx + radius * std::cos(ang));
+                v.push_back(cy + radius * std::sin(ang));
+                v.push_back(cz + ((i % 2) ? spike : -0.25f * spike));
             }
             for (int i = 0; i < n; ++i) {
                 f.push_back(c);
                 f.push_back(c + 1 + i);
                 f.push_back(c + 1 + (i + 1) % n);
             }
-        }
-        const int floater_faces = 160;
-        // Dust under 2% of the body, farther out at x=2. The pre-pass drops it.
+        };
+        // Attached ear: center is 0.5 voxel off the body face at x=0.4. 160/6272 = 2.55%.
+        add_fan(0.4f + 0.5f * voxel, 0.f, 0.f, 160, 0.03f, 0.12f);
+        // Detached shell, same face count, many voxels away.
+        add_fan(1.2f, 0.f, 0.f, 160, 0.05f, 0.18f);
+        // Dust under 2%.
         const int dust_faces = 40;
-        {
-            const int c = (int)v.size() / 3;
-            const float cx = 2.0f;
-            v.insert(v.end(), {cx, 0.f, 0.f});
-            for (int i = 0; i < dust_faces; ++i) {
-                const float ang = 6.2831853f * (float)i / (float)dust_faces;
-                v.push_back(cx + 0.02f * std::cos(ang));
-                v.push_back(0.02f * std::sin(ang));
-                v.push_back((i % 2) ? 0.05f : -0.02f);
-            }
-            for (int i = 0; i < dust_faces; ++i) {
-                f.push_back(c);
-                f.push_back(c + 1 + i);
-                f.push_back(c + 1 + (i + 1) % dust_faces);
-            }
-        }
+        add_fan(2.4f, 0.f, 0.f, dust_faces, 0.02f, 0.05f);
+        // Foot at ~4% of the body, far away. Must survive the proximity cut.
+        const int foot_faces = 250;
+        add_fan(-1.2f, 0.f, 0.f, foot_faces, 0.05f, 0.18f);
+        const int floater_faces = 160;
         // Flat slab, ~25% of the body, at y=-1. QEM reduces it to a few triangles.
         {
             const int n = 28;
@@ -419,42 +406,50 @@ int main() {
         const auto before = comp_sizes(v, f);
         std::printf("floater before: components");
         for (int s : before) std::printf(" %d", s);
-        std::printf(" (body %d, shell %d = %.2f%%, dust %d = %.2f%%)\n",
+        std::printf(" (body %d, 2.5%% parts %d = %.2f%%, dust %d = %.2f%%, foot %d = %.2f%%)\n",
                     body_faces, floater_faces, 100.0 * floater_faces / body_faces,
-                    dust_faces, 100.0 * dust_faces / body_faces);
+                    dust_faces, 100.0 * dust_faces / body_faces,
+                    foot_faces, 100.0 * foot_faces / body_faces);
 
-        // 2% before QEM, 3% after. Dust goes. The 2–3% shell stays. The slab
-        // collapses and the post-pass removes it. The second body stays.
         {
             std::vector<float> a = v;
             std::vector<int32_t> b = f;
-            const int dropped = trellis::drop_small_components(a, b, 0.02f);
+            const int dropped = trellis::drop_pre_decimation_components(a, b, voxel);
             const float xmax_pre = bbox_max_x(a);
+            float xmin_pre = 1e9f;
+            for (size_t i = 0; i < a.size(); i += 3) xmin_pre = std::min(xmin_pre, a[i]);
+            const auto pre = comp_sizes(a, b);
+            std::printf("floater after pre: dropped=%d xmax=%.3f xmin=%.3f components", dropped, xmax_pre, xmin_pre);
+            for (int s : pre) std::printf(" %d", s);
+            std::printf("\n");
+            if (dropped < 2)
+                rc |= fail("expected the detached shell and the dust to drop");
+            if (!(xmax_pre > 0.402f && xmax_pre < 0.5f))
+                rc |= fail("attached 2.5% part should stay and the detached shell should go");
+            if (!(xmin_pre < -1.0f))
+                rc |= fail("detached foot at ~4% of the body was dropped");
             std::vector<float> ov;
             std::vector<int32_t> of;
             trellis::decimate_qem(a, (int)a.size() / 3, b, (int)b.size() / 3, 900, ov, of);
-            const auto mid = comp_sizes(ov, of);
-            std::printf("floater after QEM@900 (2%% pre, dropped=%d, xmax_pre=%.3f):", dropped, xmax_pre);
-            for (int s : mid) std::printf(" %d", s);
-            std::printf("\n");
             trellis::drop_small_components(ov, of, 0.03f);
             const auto after = comp_sizes(ov, of);
             const float xmax = bbox_max_x(ov);
-            float ymin = 1e9f;
-            for (size_t i = 1; i < ov.size(); i += 3) ymin = std::min(ymin, ov[i]);
+            float xmin = 1e9f, ymin = 1e9f;
+            for (size_t i = 0; i < ov.size(); i += 3) {
+                xmin = std::min(xmin, ov[i]);
+                ymin = std::min(ymin, ov[i + 1]);
+            }
             std::printf("floater after post 3%%:");
             for (int s : after) std::printf(" %d", s);
-            std::printf("  bbox_max_x=%.3f ymin=%.3f\n", xmax, ymin);
-            if (xmax_pre > 1.6f)
-                rc |= fail("dust under 2% survived the pre-decimation cut");
-            if (xmax < 0.8f)
-                rc |= fail("2-3% shell was dropped; the 2% cutoff should keep it");
-            if (xmax > 1.6f)
-                rc |= fail("dust survived QEM");
+            std::printf("  bbox x=[%.3f, %.3f] ymin=%.3f\n", xmin, xmax, ymin);
             if (ymin < -0.8f)
                 rc |= fail("flat slab survived the post-QEM face-count cut");
-            if (after.size() != 3)
-                rc |= fail("expected body + secondary + 2-3% shell after both cuts");
+            if (!(xmax > 0.40f && xmax < 0.5f))
+                rc |= fail("attached part did not survive QEM");
+            if (!(xmin < -1.0f))
+                rc |= fail("foot did not survive QEM");
+            if (after.size() != 4)
+                rc |= fail("expected body, secondary, attached part, and foot");
             if (after.empty() || after[0] < 200)
                 rc |= fail("main body collapsed below the QEM target's useful range");
         }

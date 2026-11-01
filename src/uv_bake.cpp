@@ -517,6 +517,214 @@ int drop_small_components(std::vector<float>& verts, std::vector<int32_t>& faces
     return dropped;
 }
 
+namespace {
+
+struct CompGrid {
+    const float* verts = nullptr;
+    double cell = 1;
+    std::unordered_map<uint64_t, std::vector<int>> buckets;
+    std::unordered_map<uint64_t, int> rep;   // one body vertex per cell, for the coarse grid
+
+    static uint64_t key(int x, int y, int z) {
+        uint64_t h = (uint64_t)(uint32_t)x * 0x9E3779B185EBCA87ull;
+        h ^= (uint64_t)(uint32_t)y * 0xC2B2AE3D27D4EB4Full;
+        h ^= (uint64_t)(uint32_t)z * 0x165667B19E3779F9ull;
+        return h;
+    }
+    int idx(double x) const { return (int)std::floor(x / cell); }
+    void add(int vi, bool keep_all) {
+        const float* p = verts + 3 * vi;
+        const uint64_t k = key(idx(p[0]), idx(p[1]), idx(p[2]));
+        if (keep_all) buckets[k].push_back(vi);
+        else rep.emplace(k, vi);
+    }
+    static double dist2(const float* a, const float* b) {
+        const double dx = (double)a[0] - (double)b[0];
+        const double dy = (double)a[1] - (double)b[1];
+        const double dz = (double)a[2] - (double)b[2];
+        return dx * dx + dy * dy + dz * dz;
+    }
+    // Distance from p to the outside of the cube of cells within chebyshev radius R.
+    // Any point outside that cube is at least this far from p.
+    double clearance(const float* p, int cx, int cy, int cz, int R) const {
+        const double lo_x = (cx - R) * cell, hi_x = (cx + R + 1) * cell;
+        const double lo_y = (cy - R) * cell, hi_y = (cy + R + 1) * cell;
+        const double lo_z = (cz - R) * cell, hi_z = (cz + R + 1) * cell;
+        const double dx = std::min((double)p[0] - lo_x, hi_x - (double)p[0]);
+        const double dy = std::min((double)p[1] - lo_y, hi_y - (double)p[1]);
+        const double dz = std::min((double)p[2] - lo_z, hi_z - (double)p[2]);
+        return std::max(0.0, std::min(dx, std::min(dy, dz)));
+    }
+    // Min squared distance to a stored vertex inside the 3x3x3 block around p.
+    // With cell == attach distance, every vertex within one cell of p is in that block.
+    double probe3(const float* p) const {
+        const int cx = idx(p[0]), cy = idx(p[1]), cz = idx(p[2]);
+        double best = 1e300;
+        for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    auto it = buckets.find(key(cx + dx, cy + dy, cz + dz));
+                    if (it == buckets.end()) continue;
+                    for (int vi : it->second) best = std::min(best, dist2(p, verts + 3 * vi));
+                }
+        return best;
+    }
+    // Nearest rep: upper bound is a real distance, lower bound never exceeds the truth.
+    void nearest_rep(const float* p, double& lower, double& upper2) const {
+        const int cx = idx(p[0]), cy = idx(p[1]), cz = idx(p[2]);
+        upper2 = 1e300;
+        int first = -1;
+        for (int R = 0; R < 128; ++R) {
+            for (int dz = -R; dz <= R; ++dz)
+                for (int dy = -R; dy <= R; ++dy)
+                    for (int dx = -R; dx <= R; ++dx) {
+                        if (R && std::max(std::abs(dx), std::max(std::abs(dy), std::abs(dz))) != R) continue;
+                        auto it = rep.find(key(cx + dx, cy + dy, cz + dz));
+                        if (it == rep.end()) continue;
+                        if (first < 0) first = R;
+                        upper2 = std::min(upper2, dist2(p, verts + 3 * it->second));
+                    }
+            if (upper2 <= clearance(p, cx, cy, cz, R) * clearance(p, cx, cy, cz, R)) break;
+        }
+        lower = (first <= 0) ? 0.0 : (double)(first - 1) * cell;
+    }
+    // Min squared distance to a body vertex inside the ball of radius `radius` around p.
+    double min_d2_within(const float* p, double radius) const {
+        if (!(radius > 0)) return 1e300;
+        const int cx = idx(p[0]), cy = idx(p[1]), cz = idx(p[2]);
+        const int rad = (int)std::ceil(radius / cell) + 1;
+        double best = 1e300;
+        for (int dz = -rad; dz <= rad; ++dz)
+            for (int dy = -rad; dy <= rad; ++dy)
+                for (int dx = -rad; dx <= rad; ++dx) {
+                    auto it = buckets.find(key(cx + dx, cy + dy, cz + dz));
+                    if (it == buckets.end()) continue;
+                    for (int vi : it->second) best = std::min(best, dist2(p, verts + 3 * vi));
+                }
+        return best;
+    }
+};
+
+}  // namespace
+
+int drop_pre_decimation_components(std::vector<float>& verts, std::vector<int32_t>& faces,
+                                   float voxel_world) {
+    const int V = (int)verts.size() / 3;
+    const size_t F = faces.size() / 3;
+    if (V == 0 || F == 0 || !(voxel_world > 0.f)) return 0;
+    std::vector<int> par((size_t)V);
+    for (int i = 0; i < V; ++i) par[i] = i;
+    auto find = [&](int x) { while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+    auto uni  = [&](int a, int b) { int ra = find(a), rb = find(b); if (ra != rb) par[ra] = rb; };
+    for (size_t f = 0; f < F; ++f) { uni(faces[3*f], faces[3*f+1]); uni(faces[3*f+1], faces[3*f+2]); }
+
+    std::unordered_map<int, int> fc;
+    for (size_t f = 0; f < F; ++f) fc[find(faces[3*f])]++;
+    int main_root = -1, maxfc = 0;
+    for (auto& kv : fc) if (kv.second > maxfc) { maxfc = kv.second; main_root = kv.first; }
+    if (main_root < 0 || maxfc <= 0) return 0;
+    const int thresh2 = (int)(0.02 * maxfc);
+    const int thresh3 = (int)(0.03 * maxfc);
+
+    std::vector<int> body_verts;
+    body_verts.reserve((size_t)maxfc);
+    std::vector<uint8_t> seen((size_t)V, 0);
+    for (size_t f = 0; f < F; ++f) {
+        if (find(faces[3*f]) != main_root) continue;
+        for (int k = 0; k < 3; ++k) {
+            const int v = faces[3*f + k];
+            if (!seen[v]) { seen[v] = 1; body_verts.push_back(v); }
+        }
+    }
+    const double attach = (double)kPreDecimAttachVoxels * (double)voxel_world;
+    const double attach2 = attach * attach;
+    CompGrid fine;
+    fine.verts = verts.data();
+    fine.cell = attach > 0 ? attach : (double)voxel_world;
+    fine.buckets.reserve(body_verts.size() * 2);
+    for (int vi : body_verts) fine.add(vi, true);
+    CompGrid coarse;
+    coarse.verts = verts.data();
+    coarse.cell = std::max(8.0 * (double)voxel_world, fine.cell);
+    coarse.rep.reserve(body_verts.size() / 8 + 1);
+    for (int vi : body_verts) coarse.add(vi, false);
+
+    struct Item { int root; int faces; double gap_vox; bool drop; const char* why; };
+    std::vector<Item> items;
+    std::unordered_map<int, std::vector<int>> cverts;
+    for (size_t f = 0; f < F; ++f) {
+        const int r = find(faces[3*f]);
+        if (r == main_root) continue;
+        auto& cv = cverts[r];
+        for (int k = 0; k < 3; ++k) cv.push_back(faces[3*f + k]);
+    }
+    for (auto& kv : cverts) {
+        auto& cv = kv.second;
+        std::sort(cv.begin(), cv.end());
+        cv.erase(std::unique(cv.begin(), cv.end()), cv.end());
+        const int faces_n = fc[kv.first];
+        // >= 3% of the body is kept even when it floats (the feet are ~3.9%).
+        if (!(faces_n < thresh3)) continue;
+        double best2 = 1e300;
+        for (int vi : cv) best2 = std::min(best2, fine.probe3(verts.data() + 3 * vi));
+        double gap;
+        if (best2 <= attach2) {
+            gap = std::sqrt(best2);
+        } else {
+            struct Ord { int vi; double lower; double upper2; };
+            std::vector<Ord> ord;
+            ord.reserve(cv.size());
+            double best = 1e300;
+            for (int vi : cv) {
+                double lower = 0, upper2 = 1e300;
+                coarse.nearest_rep(verts.data() + 3 * vi, lower, upper2);
+                ord.push_back({vi, lower, upper2});
+                if (upper2 < best * best) best = std::sqrt(upper2);
+            }
+            std::sort(ord.begin(), ord.end(), [](const Ord& a, const Ord& b) { return a.lower < b.lower; });
+            for (const Ord& o : ord) {
+                if (o.lower >= best) break;
+                const double d2 = fine.min_d2_within(verts.data() + 3 * o.vi, best);
+                if (d2 < best * best) best = std::sqrt(d2);
+            }
+            gap = best;
+        }
+        const double gap_vox = gap / (double)voxel_world;
+        const bool under2 = faces_n < thresh2;
+        const bool under3 = faces_n < thresh3;
+        const bool detached = !(gap <= attach);
+        const bool drop = under2 || (under3 && detached);
+        const char* why = !drop ? "against body" : under2 ? "below 2%" : "detached";
+        if (drop || under3)
+            items.push_back({kv.first, faces_n, gap_vox, drop, why});
+    }
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.faces > b.faces; });
+    int dropped = 0;
+    for (const Item& it : items) {
+        printf("  component %s: faces=%d share=%.2f%% of %d gap=%.2f voxels (%s)\n",
+               it.drop ? "drop" : "keep", it.faces, 100.0 * it.faces / maxfc, maxfc, it.gap_vox, it.why);
+        if (it.drop) ++dropped;
+    }
+    if (!items.empty()) fflush(stdout);
+    if (dropped == 0) return 0;
+
+    std::unordered_map<int, bool> kill;
+    for (const Item& it : items) if (it.drop) kill[it.root] = true;
+    std::vector<int32_t> kf; kf.reserve(faces.size());
+    for (size_t f = 0; f < F; ++f)
+        if (!kill[find(faces[3*f])])
+            for (int k = 0; k < 3; ++k) kf.push_back(faces[3*f + k]);
+    std::vector<int> remap((size_t)V, -1);
+    std::vector<float> nv; nv.reserve(verts.size());
+    for (size_t i = 0; i < kf.size(); ++i) {
+        int v = kf[i];
+        if (remap[v] < 0) { remap[v] = (int)(nv.size() / 3); nv.insert(nv.end(), &verts[3*v], &verts[3*v] + 3); }
+        kf[i] = remap[v];
+    }
+    verts.swap(nv); faces.swap(kf);
+    return dropped;
+}
+
 // Fill small boundary loops with a centroid fan (port of CuMesh clean_up.cu fill_holes).
 // A boundary edge is a directed face edge (u,v) with no opposing (v,u); rim cycles are
 // walked in reverse face direction (v->u keeps the new fan's winding consistent with the

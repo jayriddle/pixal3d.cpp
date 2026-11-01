@@ -58,11 +58,35 @@ void decimate_qem(const std::vector<float>& verts, int V, const std::vector<int3
 // shatter our mesh into 50+ pieces) while keeping legitimately large secondary shells
 // (a hollow vase's inner+outer surface). In place; returns the number of components dropped.
 //
-// Face share is not stable across QEM: a smooth body loses far more triangles than a
-// spiky shell, so a shell under `frac` before simplification can land over it after.
-// The pipeline therefore runs this on the pre-decimation mesh (2%) and again after
-// QEM (3%, which drops flats that collapse to a handful of triangles).
+// Face share is not stable across QEM. The pre-decimation pass is
+// drop_pre_decimation_components; this face-count cut still runs after QEM
+// (3%) to drop flats that collapse to a handful of triangles.
 int drop_small_components(std::vector<float>& verts, std::vector<int32_t>& faces, float frac = 0.02f);
+
+// World length of one remesh cell. Matches remesh_narrow_band_dc: output
+// vertices are (grid/res - 0.5) * (res + 3*band)/res, so one grid step is
+// (res + 3*band) / res^2.
+inline float remesh_voxel_world(int res, int band) {
+    if (res < 1) res = 1;
+    const int b = band < 1 ? 1 : band;
+    return (float)(res + 3 * b) / ((float)res * (float)res);
+}
+
+// A component whose closest vertex is within this many remesh voxels of the
+// main body is touching it or sitting right against it (a remesh crack, an
+// ear, an antenna). Farther than this, and under 3% of the body's faces, it
+// is a detached shell.
+constexpr float kPreDecimAttachVoxels = 3.f;
+
+// Pre-decimation filter. Largest component is the body.
+// - face share < 2%: dropped
+// - face share < 3% and gap > kPreDecimAttachVoxels: dropped
+// - face share >= 3% (feet at ~3.9%): kept even when detached
+// - face share in [2%, 3%) and within the attach distance: kept
+// `voxel_world` is remesh_voxel_world(res, band). Logs every drop with face
+// share and gap, and every keep in the [2%, 3%) band. Returns components dropped.
+int drop_pre_decimation_components(std::vector<float>& verts, std::vector<int32_t>& faces,
+                                   float voxel_world);
 
 // xatlas PackOptions::padding, in packer pixels. Full gutter when the atlas has
 // about 4+ texels per face (the 250k / 1024 bake). Fades to 0 as the mesh
