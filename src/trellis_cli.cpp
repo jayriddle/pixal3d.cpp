@@ -36,6 +36,13 @@
 
 using std::vector;
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+// --decim selects the legacy cluster grid (or disables decimation at 0). The
+// quadric target from --faces applies only to the default QEM path.
+static void note_faces_vs_decim(const trellis::TrellisParams& cfg) {
+    if (cfg.faces > 0 && cfg.decim >= 0)
+        fprintf(stderr, "[trellis] --faces %d ignored: --decim %d selects cluster-grid decimation (0 keeps every face)\n",
+                cfg.faces, cfg.decim);
+}
 // [dbg] overall stats of a flat tensor — used to compare LR vs HR shape-SLAT in decode space.
 static void slat_stats(const char* tag, const vector<float>& v) {
     if (v.empty()) { printf("      [stats] %s EMPTY\n", tag); return; }
@@ -556,9 +563,11 @@ int trellis_run_mv(const trellis::TrellisParams& cfg) {
     bool textured = false;
     if (!pbr6.empty()) {
         const bool boxuv = !cfg.xatlas;
-        // MV mode defaults (unless overridden by --atlas/--tex, --decim): atlas 4096 and a
-        // 1,000,000-face quadric target, matching inference_mv.py's o_voxel.postprocess.to_glb(
-        // texture_size=4096, decimation_target=1_000_000) -- TRELLIS.2's 2048/300K stay as-is below.
+        // Pixal atlas default is 4096 (inference_mv.py texture_size), overridable with
+        // --atlas/--tex. The quadric target is qem_face_target(true): 250000 unless
+        // --faces is set. The old 1,000,000 hard-code matched inference_mv.py but sat
+        // above a typical remesh, so QEM never ran. TRELLIS.2's own targets are unchanged
+        // in trellis_run below.
         const int T = cfg.tex >= 0 ? cfg.tex : 4096;
         trellis::weld_vertices(mesh.verts, mesh.faces, colors.empty() ? nullptr : &colors, 1.0f / ((float)so.res * 8.0f));
         trellis::fill_small_holes(mesh.faces);
@@ -573,12 +582,13 @@ int trellis_run_mv(const trellis::TrellisParams& cfg) {
         const std::vector<float>& sverts = rm.F() > 0 ? rm.verts : mesh.verts;
         const std::vector<int32_t>& sfaces = rm.F() > 0 ? rm.faces : mesh.faces;
         std::vector<float> dv, dp; std::vector<int32_t> df;
+        note_faces_vs_decim(cfg);
         if (cfg.decim > 0) {
             trellis::decimate_cluster(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3, {}, cfg.decim, dv, df, dp);
         } else if (cfg.decim == 0) {
             dv = sverts; df = sfaces;
         } else {
-            trellis::decimate_qem(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3, 1000000, dv, df);
+            trellis::decimate_qem(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3, cfg.qem_face_target(true), dv, df);
             trellis::weld_vertices(dv, df, nullptr, 1.0f / ((float)so.res * 8.0f));
             trellis::fill_small_holes(df);
             int ndrop2 = trellis::drop_small_components(dv, df, 0.03f);
@@ -1074,13 +1084,14 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         const std::vector<float>& sverts = rm.F() > 0 ? rm.verts : mesh.verts;
         const std::vector<int32_t>& sfaces = rm.F() > 0 ? rm.faces : mesh.faces;
         std::vector<float> dv, dp; std::vector<int32_t> df;
+        note_faces_vs_decim(cfg);
         if (cfg.decim > 0) {
             trellis::decimate_cluster(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3, {}, cfg.decim, dv, df, dp);
         } else if (cfg.decim == 0) {
             dv = sverts; df = sfaces;
         } else {
             trellis::decimate_qem(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3,
-                                  cascade ? 300000 : 150000, dv, df);
+                                  cfg.qem_face_target(false), dv, df);
             trellis::weld_vertices(dv, df, nullptr, 1.0f / ((float)so.res * 8.0f));
             trellis::fill_small_holes(df);
             // Second component pass on the decimated mesh: a hallucinated ground plane

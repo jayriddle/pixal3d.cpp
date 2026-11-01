@@ -5,12 +5,21 @@
 //
 //   post-replay <dump.bin> <out.glb> [--box-uv] [--faces N] [--atlas T]
 //               [--decim GRID] [--no-weld] [--no-fill]
+//
+// --faces N is the quadric (QEM) target, the same flag as trellis-cli. The
+// default 300000 matches the TRELLIS.2 cascade. Pixal (--views / --sv-image)
+// defaults to 250000 in the CLI; pass --faces 250000 to re-bake a Pixal dump
+// the same way — a dump does not record which pipeline produced it. --decim
+// selects the legacy cluster grid and ignores --faces, matching the CLI.
 #include "uv_bake.h"
 #include "tri_bvh.h"
 #include "remesh_dc.h"
 #include "mesh_glb.h"
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -36,17 +45,40 @@ static void audit(const char* tag, const std::vector<int32_t>& faces) {
     fflush(stdout);
 }
 
+static bool parse_pos_int(const char* s, int& out) {
+    if (!s || !*s) return false;
+    char* end = nullptr;
+    errno = 0;
+    const long v = std::strtol(s, &end, 10);
+    if (errno == ERANGE || !end || *end != '\0' || v <= 0 || v > INT_MAX) return false;
+    out = (int)v;
+    return true;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 3) { fprintf(stderr, "usage: post-replay <dump.bin> <out.glb> [opts]\n"); return 1; }
+    if (argc < 3) {
+        fprintf(stderr, "usage: post-replay <dump.bin> <out.glb> [--faces N] [--atlas T] [--decim GRID] [--box-uv] ...\n"
+                        "  --faces N   QEM target (default 300000, the TRELLIS.2 cascade;\n"
+                        "              pass 250000 to match the Pixal/MV CLI default)\n");
+        return 1;
+    }
     const char* dump = argv[1];
     const char* out = argv[2];
     bool boxuv = false, do_weld = true, do_fill = true, do_bake = true, do_remesh = true, do_snap = true;
     int band = 1;
     int faces_target = 300000, atlas = 2048, decim = -1;
+    bool faces_set = false;
     for (int i = 3; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--box-uv") boxuv = true;
-        else if (a == "--faces" && i+1 < argc) faces_target = atoi(argv[++i]);
+        else if (a == "--faces") {
+            if (i + 1 >= argc) { fprintf(stderr, "post-replay: --faces needs a value\n"); return 1; }
+            if (!parse_pos_int(argv[++i], faces_target)) {
+                fprintf(stderr, "post-replay: --faces expects a positive integer, got '%s'\n", argv[i]);
+                return 1;
+            }
+            faces_set = true;
+        }
         else if (a == "--atlas" && i+1 < argc) atlas = atoi(argv[++i]);
         else if (a == "--decim" && i+1 < argc) decim = atoi(argv[++i]);
         else if (a == "--no-weld") do_weld = false;
@@ -71,6 +103,11 @@ int main(int argc, char** argv) {
     if (fread(pbr6.data(),4,pbr6.size(),f) != pbr6.size()) return 1;
     fclose(f);
     printf("loaded: V=%d F=%d voxels=%d res=%d\n", V, F, Mv, res);
+    if (decim >= 0 && faces_set)
+        fprintf(stderr, "post-replay: --faces %d ignored: --decim %d selects cluster-grid decimation (0 keeps every face)\n",
+                faces_target, decim);
+    else if (decim < 0)
+        printf("  qem faces=%d\n", faces_target);
 
     double t = now();
     if (do_weld) trellis::weld_vertices(verts, faces, nullptr, 1.0f / ((float)res * 8.0f));

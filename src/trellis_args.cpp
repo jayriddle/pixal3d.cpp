@@ -88,9 +88,14 @@ void print_usage(const char* argv0, bool server) {
         "      --band N            narrow-band DC remesh band width (default: auto —\n"
         "                          res/512, i.e. 1 @512 / 2 @1024, which suppresses the\n"
         "                          res-1024 outer-skin speckle; N forces that width)\n"
-        "      --decim GRID        legacy cluster-grid decimation (default: quadric\n"
-        "                          simplify to 300K faces @1024 / 150K @512; 0 = none)\n"
-        "      --atlas PX          UV atlas size (default 2048 @1024 / 1024 @512)\n"
+        "      --decim GRID        legacy cluster-grid decimation. Default is quadric\n"
+        "                          simplify (--faces); 0 = keep every face. --faces is\n"
+        "                          ignored when --decim is set.\n"
+        "      --faces N           quadric (QEM) face target before the UV bake\n"
+        "                          (default: %d for Pixal --views/--sv-image;\n"
+        "                          %d on the TRELLIS.2 cascade, %d at --res 512)\n"
+        "      --atlas PX          UV atlas size (default 2048 @1024 / 1024 @512;\n"
+        "                          Pixal --views/--sv-image default 4096)\n"
         "      --tex-res N         texture PBR resolution 512/1024 (default: auto — drops\n"
         "                          a dense res-1024 decode to a clean res-512 PBR volume)\n"
         "      --webp on|off       encode GLB textures as WebP (default: on when built with\n"
@@ -108,7 +113,10 @@ void print_usage(const char* argv0, bool server) {
         "      --host H  --port P  trellis-server bind address\n"
         "      --voxply            also dump the voxel point cloud as .ply\n"
         "      --dump-slat         dump the structured latent to disk\n"
-        "  -h, --help              show this help\n");
+        "  -h, --help              show this help\n",
+        TrellisParams{}.qem_face_target(true),
+        TrellisParams{}.qem_face_target(false),
+        []{ TrellisParams light; light.set_res(512); return light.qem_face_target(false); }());
 }
 
 bool parse_args(int argc, char** argv, TrellisParams& p) {
@@ -170,6 +178,10 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         else if (a == "--dump-post")            { const char* v = need(a.c_str()); if (!v) return false; p.dump_post = v; }
         else if (a == "--band")                 { const char* v = need(a.c_str()); if (!v) return false; p.band = atoi(v); }
         else if (a == "--decim")                { const char* v = need(a.c_str()); if (!v) return false; p.decim = atoi(v); }
+        else if (a == "--faces")                { const char* v = need(a.c_str()); if (!v) return false;
+                                                  if (!parse_int_strict(v, p.faces) || p.faces <= 0) {
+                                                      fprintf(stderr, "[trellis] --faces expects a positive integer, got '%s'\n", v); return false;
+                                                  } }
         else if (a == "--atlas" || a == "--tex"){ const char* v = need(a.c_str()); if (!v) return false; p.tex = atoi(v); }
         else if (a == "--tex-res")              { const char* v = need(a.c_str()); if (!v) return false; p.tex_res = atoi(v); }
         else if (a == "--webp")                 { const char* v = need(a.c_str()); if (!v) return false;

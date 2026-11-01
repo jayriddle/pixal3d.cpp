@@ -236,6 +236,26 @@ void telea_inpaint(std::vector<uint8_t>& base, std::vector<uint8_t>& mr,
         }
     }
 }
+
+// Packer-pixel gutter for xatlas. resolution stays 0: xatlas then builds one
+// atlas aimed at ~1024 (a non-zero resolution turns on multi-atlas packing,
+// which this baker does not composite). Chart UVs and the returned width/height
+// are both in that packer pixel space — xatlas already shifts UVs by -padding
+// and trims the outer margin — and uv_bake normalizes by width/height into the
+// bake atlas. A packer padding of P therefore becomes about 2P * texsize/1024
+// bake pixels between chart contents, so the gutter scales with the atlas.
+//
+// The target gap is max(8, texsize/128) bake pixels: 8 px at 1024 (wider than
+// the radius-3 Telea window, so the fill dilates each chart into its own gutter
+// instead of averaging a neighbour), 16 px at 2048, 32 px at 4096. Below 1024
+// the packer is still ~1024 and the normalization scales the gutter down, so P
+// grows to hold the 8 px floor.
+uint32_t xatlas_pack_padding(int texsize) {
+    if (texsize < 1) texsize = 1;
+    const int gutter = std::max(8, texsize / 128);
+    const int pad = (gutter * 512 + texsize - 1) / texsize;   // ceil(gutter * 1024 / (2 * texsize))
+    return (uint32_t)std::max(2, std::min(pad, 64));
+}
 }  // namespace
 
 void decimate_cluster(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
@@ -782,8 +802,11 @@ BakedMesh uv_chart_project(const std::vector<float>& verts, int V, const std::ve
             }
     }
 
-    // shelf packing: global scale found by bisection so everything fits with padding
-    const int pad = 2;
+    // shelf packing: global scale found by bisection so everything fits with padding.
+    // The slot is content + 2*pad and the chart origin is inset by pad, so the
+    // content-to-content gutter is 2*pad bake pixels. Same floor-and-scale as
+    // the xatlas packer: 8 px at 1024, 16 px at 2048, 32 px at 4096.
+    const int pad = std::max(4, texsize / 256);
     std::vector<int> order(cs.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = (int)i;
     float total = 0;
@@ -1195,15 +1218,20 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
     worker.join();
     delete done;
 
-    // Reference packing (spec 27 §6.3): stock PackOptions — padding 0,
-    // resolution 0 (xatlas grows a single ~1024² atlas at its own density
-    // estimate), blockAlign false, bilinear true — and the binding then
-    // divides UVs by the final atlas width/height, so charts always span the
-    // FULL [0,1]² regardless of the packer's internal resolution. Density and
-    // occupancy at the bake size come from this normalization, not from
-    // packing at the bake resolution; chart-to-chart bleed at 0 padding is
-    // handled by the inpaint (as in the reference).
+    // Packing diverges from the reference's stock PackOptions (spec 27 §6.3,
+    // padding 0) by inserting a gutter. resolution stays 0 so xatlas still
+    // grows a single ~1024² atlas (multi-atlas mode is not composited here);
+    // blockAlign stays off; bilinear stays on so the occupancy mask includes
+    // the bilinear footprint. UVs are divided by the final atlas width/height
+    // below — the same normalization as the reference binding — so the gutter
+    // xatlas left between charts is mapped into the bake atlas along with the
+    // charts. Density still comes from that normalization, not from packing
+    // at the bake resolution.
     xatlas::PackOptions po;
+    po.padding = xatlas_pack_padding(texsize);
+    po.resolution = 0;
+    po.bilinear = true;
+    po.blockAlign = false;
     xatlas::PackCharts(atlas, po);
     if (atlas->meshCount == 0 || atlas->width == 0) { xatlas::Destroy(atlas); return out; }
 
@@ -1425,7 +1453,10 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
     xatlas::Destroy(atlas);
 
     telea_inpaint(out.base, out.mr, mask, T, 3, 1);
-    printf("  uv_bake: atlas %dx%d (xatlas %dx%d), Vo=%zu Fo=%d\n", T, T, W, H, out.verts.size()/3, FoAll);
+    // ~2*padding packer pixels between chart contents, scaled into the bake atlas.
+    const float bake_gutter = (W > 0) ? (2.f * (float)po.padding * (float)T / (float)W) : 0.f;
+    printf("  uv_bake: atlas %dx%d (xatlas %dx%d, pack padding %u, bake gutter ~%.1f px), Vo=%zu Fo=%d\n",
+           T, T, W, H, po.padding, bake_gutter, out.verts.size()/3, FoAll);
     fflush(stdout);
     return out;
 }
