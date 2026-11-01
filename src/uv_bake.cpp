@@ -597,6 +597,9 @@ double frontier_gap(const BodyGrid& body, const float* verts, const std::vector<
             continue;
         }
         if (best_d >= 0) continue;
+        // Cap the search. Past this the piece is far beyond the 3-voxel attach
+        // distance; returning -1 lets the caller fall back to the box gap.
+        if (n.d >= 96) break;
         for (int dz = -1; dz <= 1; ++dz)
             for (int dy = -1; dy <= 1; ++dy)
                 for (int dx = -1; dx <= 1; ++dx) {
@@ -606,7 +609,6 @@ double frontier_gap(const BodyGrid& body, const float* verts, const std::vector<
                     if (!seen.emplace(nk, n.d + 1).second) continue;
                     q.push({x, y, z, n.d + 1, k, false});
                 }
-        if (n.d > 96) break;
     }
     double best2 = 1e300;
     std::unordered_set<uint64_t> near_cand;
@@ -635,6 +637,8 @@ double frontier_gap(const BodyGrid& body, const float* verts, const std::vector<
                     best2 = std::min(best2, BodyGrid::dist2(verts + 3 * vi, verts + 3 * bi));
         }
     }
+    // No body vertex found within the cap. Do not sqrt() a sentinel.
+    if (!(best2 < 1e299)) return -1.0;
     return std::sqrt(best2);
 }
 
@@ -744,6 +748,10 @@ int drop_pre_decimation_components(std::vector<float>& verts, std::vector<int32_
             // Stride first so a part sitting on the body exits without a full scan.
             const size_t step = std::max<size_t>(1, cv.size() / 4096);
             for (size_t i = 0; i < cv.size() && !against; i += step) consider(cv[i]);
+            // Emscripten production builds link without pthreads. Constructing
+            // std::thread then throws and aborts the bake. The serial scan
+            // below makes the same keep/drop decision.
+#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
             if (!against && cv.size() > 8192) {
                 const unsigned nt = std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
                 std::atomic<int> stop{0};
@@ -766,14 +774,21 @@ int drop_pre_decimation_components(std::vector<float>& verts, std::vector<int32_
                     if (b2 < best2) best2 = b2;
                     if (b2 <= attach2) against = true;
                 }
-            } else if (!against) {
+            } else
+#endif
+            if (!against) {
                 for (int vi : cv) {
                     consider(vi);
                     if (against) break;
                 }
             }
             if (against) gap = std::sqrt(best2);
-            else gap = frontier_gap(body, verts.data(), cv);
+            else {
+                const double g = frontier_gap(body, verts.data(), cv);
+                // Negative means the BFS cap was hit and no body vertex was
+                // found. That piece is far past the attach distance.
+                gap = g >= 0.0 ? g : std::max(box_gap, body.cell * 96.0);
+            }
         }
         const bool detached = !(gap <= attach);
         items.push_back({root, fc[root], gap / (double)voxel_world, detached, true,
