@@ -580,8 +580,9 @@ int trellis_run_mv(const trellis::TrellisParams& cfg) {
         if (rm.F() > 0) {
             trellis::clean_mesh(rm.V(), rm.faces);
             // 2% always, plus a detached shell under 3% of the body. Measured
-            // here, before QEM moves face share around. The same rule runs
-            // again after QEM so an against-body part is not deleted later.
+            // here, before QEM. The post-QEM pass is a plain 3% face cut: the
+            // pieces that sit ~2 voxels inside the wall are under 3% and are
+            // inner skins, not parts to keep.
             int ndrop = trellis::drop_pre_decimation_components(rm.verts, rm.faces, trellis::remesh_voxel_world(so.res, remesh_band));
             printf("  remesh postproc: dropped %d floater comps -> V=%d F=%d\n", ndrop, rm.V(), rm.F());
         }
@@ -597,7 +598,9 @@ int trellis_run_mv(const trellis::TrellisParams& cfg) {
             trellis::decimate_qem(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3, cfg.qem_face_target(true), dv, df);
             trellis::weld_vertices(dv, df, nullptr, 1.0f / ((float)so.res * 8.0f));
             trellis::fill_small_holes(df);
-            int ndrop2 = trellis::drop_pre_decimation_components(dv, df, trellis::remesh_voxel_world(so.res, remesh_band));
+            // Plain 3% face cut. Removes the inward skins the pre-pass kept
+            // because they sit against the wall (gap ~2 voxels, share ~2%).
+            int ndrop2 = trellis::drop_small_components(dv, df, 0.03f);
             if (ndrop2) printf("  decimated postproc: dropped %d more comps -> F=%d\n", ndrop2, (int)df.size()/3);
         }
         const int dV = (int)dv.size()/3, dF = (int)df.size()/3;
@@ -1100,9 +1103,8 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                                   cfg.qem_face_target(false), dv, df);
             trellis::weld_vertices(dv, df, nullptr, 1.0f / ((float)so.res * 8.0f));
             trellis::fill_small_holes(df);
-            // Same rule as the pre-pass. A flat slab that collapses and stays
-            // detached is dropped; a part that was against the body is not.
-            int ndrop2 = trellis::drop_pre_decimation_components(dv, df, trellis::remesh_voxel_world(so.res, remesh_band));
+            // Plain 3% face cut, same as the Pixal path.
+            int ndrop2 = trellis::drop_small_components(dv, df, 0.03f);
             if (ndrop2) { printf("  decimated postproc: dropped %d more comps -> F=%d\n", ndrop2, (int)df.size()/3); fflush(stdout); }
         }
         const int dV = (int)dv.size()/3, dF = (int)df.size()/3;

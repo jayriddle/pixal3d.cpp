@@ -150,7 +150,7 @@ int main(int argc, char** argv) {
         audit("weld2", df);
         trellis::fill_small_holes(df);
         audit("fill2", df);
-        int ndrop2 = trellis::drop_pre_decimation_components(dv, df, trellis::remesh_voxel_world(res, band));
+        int ndrop2 = trellis::drop_small_components(dv, df, 0.03f);
         if (ndrop2) printf("  dropped %d more comps\n", ndrop2);
         audit("drop2", df);
     }

@@ -432,7 +432,7 @@ int main() {
             std::vector<float> ov;
             std::vector<int32_t> of;
             trellis::decimate_qem(a, (int)a.size() / 3, b, (int)b.size() / 3, 900, ov, of);
-            trellis::drop_pre_decimation_components(ov, of, voxel);
+            trellis::drop_small_components(ov, of, 0.03f);
             const auto after = comp_sizes(ov, of);
             const float xmax = bbox_max_x(ov);
             float xmin = 1e9f, ymin = 1e9f;
@@ -456,8 +456,9 @@ int main() {
         }
     }
 
-    // QEM no-op: face shares stay put. A second pass must keep the attached
-    // 2.5% part (the old post-QEM 3% face cut would delete it) and drop a far shell.
+    // Pre-pass keeps an against-body 2.5% part and drops a far shell. The
+    // post-QEM pass is the plain 3% face cut, which then removes that part.
+    // Those pieces are inward skins ~2 voxels inside the wall, not ears.
     {
         const float voxel = 0.01f;
         std::vector<float> v;
@@ -491,15 +492,21 @@ int main() {
             xmin = std::min(xmin, v[i]);
         }
         if (!(xmax > 0.40f && xmax < 0.6f))
-            rc |= fail("consistency: attached 2.5% part was dropped on the first pass");
+            rc |= fail("consistency: attached 2.5% part was dropped on the pre-pass");
         if (xmax > 1.0f)
-            rc |= fail("consistency: detached 2.5% shell survived the first pass");
-        trellis::drop_pre_decimation_components(v, f, voxel);
-        if ((int)f.size() / 3 != mid)
-            rc |= fail("consistency: second pass removed the against-body part");
+            rc |= fail("consistency: detached 2.5% shell survived the pre-pass");
+        trellis::drop_small_components(v, f, 0.03f);
+        const int after = (int)f.size() / 3;
+        float xmax2 = -1e9f;
+        for (size_t i = 0; i < v.size(); i += 3) xmax2 = std::max(xmax2, v[i]);
+        if (after != mid - npart)
+            rc |= fail("consistency: post-QEM 3% cut should remove the 2.5% inner piece");
+        if (xmax2 > 0.401f)
+            rc |= fail("consistency: post-QEM 3% cut left the against-body part");
         if (!(xmin > -0.5f))
             rc |= fail("consistency: unexpected geometry");
-        std::printf("post-pass consistency: faces %d -> %d -> %d xmax=%.3f\n", body + 2 * npart, mid, (int)f.size() / 3, xmax);
+        std::printf("post-pass consistency: faces %d -> %d -> %d xmax %.3f -> %.3f\n",
+                    body + 2 * npart, mid, after, xmax, xmax2);
     }
 
     // Large-mesh timing. Dust under 2% must not enter the gap search.
