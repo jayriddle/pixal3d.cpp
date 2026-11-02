@@ -413,6 +413,21 @@ struct ExteriorGrid {
                         for (int z = fz0; z <= fz1; ++z) push(x, y, z);
             }
         }
+        // A solid that fills the remesh cube makes every boundary block mixed, so
+        // the coarse flood never starts. The outside of the grid is still exterior:
+        // seed the empty cells on the six domain faces.
+        for (int axis = 0; axis < 3; ++axis) {
+            for (int sign = -1; sign <= 1; sign += 2) {
+                for (int a = 0; a < res; ++a) for (int b = 0; b < res; ++b) {
+                    int c[3];
+                    c[axis] = sign < 0 ? 0 : res - 1;
+                    c[(axis + 1) % 3] = a;
+                    c[(axis + 2) % 3] = b;
+                    if (getb(blocked, c[0], c[1], c[2])) continue;
+                    if (coarse_mixed(c[0], c[1], c[2])) push(c[0], c[1], c[2]);
+                }
+            }
+        }
         while (!st.empty()) {
             const int z = st.back(); st.pop_back();
             const int y = st.back(); st.pop_back();
@@ -442,6 +457,19 @@ struct ExteriorGrid {
                 step(x, y - 1, zi, prev_ym);
                 step(x, y + 1, zi, prev_yp);
             }
+            // The span already walked ±Z inside this mixed block. A cavity that
+            // opens along Z continues into the next block, which is not a mixed
+            // neighbour the X/Y steps can see.
+            auto touch_z = [&](int nz) {
+                if ((unsigned)nz >= (unsigned)res) return;
+                if (!getb(blocked, x, y, nz)) {
+                    const int nci = coarse_index(x, y, nz);
+                    if (ckind[(size_t)nci] == 0) cpush(x / kCoarse, y / kCoarse, nz / kCoarse);
+                }
+                push(x, y, nz);
+            };
+            if (z0 > 0) touch_z(z0 - 1);
+            if (z1 + 1 < res) touch_z(z1 + 1);
         }
         // Empty blocks touched by the fine flood (a recess entered through a
         // neck thinner than one coarse block) join the exterior.
@@ -748,7 +776,121 @@ void append_faces(Mesh& dst, const Mesh& src, const std::vector<int>& face_ids) 
     }
 }
 
-enum ShellFail { kKeep = 0, kCoverage = 1, kOpen = 2, kPieces = 3, kDropInterior = 4 };
+int count_open_edges(const std::vector<int32_t>& faces) {
+    struct EK { uint64_t k; int n; };
+    std::vector<uint64_t> keys;
+    keys.reserve(faces.size());
+    for (size_t i = 0; i + 2 < faces.size(); i += 3) {
+        for (int j = 0; j < 3; ++j) {
+            int a = faces[i + j], b = faces[i + (j + 1) % 3];
+            if (a > b) std::swap(a, b);
+            keys.push_back(((uint64_t)(uint32_t)a << 32) | (uint32_t)b);
+        }
+    }
+    std::sort(keys.begin(), keys.end());
+    int boundary = 0;
+    for (size_t i = 0; i < keys.size();) {
+        size_t j = i + 1;
+        while (j < keys.size() && keys[j] == keys[i]) ++j;
+        if (j - i == 1) ++boundary;
+        i = j;
+    }
+    return boundary;
+}
+
+// Fan-fill every clean boundary loop. Pinch contacts between the inner and outer
+// walls leave short seams; a loop that is not a simple cycle is left open so the
+// component can fall back instead of being papered over.
+struct RepairStats { int loops = 0; int edges_before = 0; int edges_after = 0; };
+
+RepairStats close_boundary_loops(std::vector<int32_t>& faces) {
+    RepairStats st;
+    st.edges_before = count_open_edges(faces);
+    if (st.edges_before == 0) return st;
+    const int max_loop = (int)faces.size();
+    auto ekey = [](int a, int b) { return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b; };
+    auto fill_loops = [&](bool directed) {
+        const size_t F = faces.size() / 3;
+        std::unordered_map<uint64_t, int> dir;
+        dir.reserve(F * 3);
+        for (size_t f = 0; f < F; ++f)
+            for (int j = 0; j < 3; ++j)
+                dir[ekey(faces[3 * f + j], faces[3 * f + (j + 1) % 3])]++;
+        if (directed) {
+            std::unordered_map<int, int> nxt, outd, ind;
+            for (const auto& kv : dir) {
+                const int a = (int)(kv.first >> 32), b = (int)(uint32_t)kv.first;
+                if (kv.second == 1 && dir.find(ekey(b, a)) == dir.end()) {
+                    nxt[b] = a; outd[b]++; ind[a]++;
+                }
+            }
+            std::unordered_map<int, char> used;
+            for (const auto& kv : nxt) {
+                const int start = kv.first;
+                if (used[start] || outd[start] != 1 || ind[start] != 1) continue;
+                std::vector<int> loop = {start};
+                int cur = start;
+                bool cycle = false, clean = true;
+                for (int steps = 0; steps <= max_loop; ++steps) {
+                    auto it = nxt.find(cur);
+                    if (it == nxt.end() || used[cur]) { clean = false; break; }
+                    cur = it->second;
+                    if (outd[cur] != 1 || ind[cur] != 1) { clean = false; break; }
+                    if (cur == start) { cycle = true; break; }
+                    loop.push_back(cur);
+                }
+                for (int v : loop) used[v] = 1;
+                if (!clean || !cycle || loop.size() < 3) continue;
+                for (size_t i = 1; i + 1 < loop.size(); ++i) {
+                    faces.push_back(loop[0]); faces.push_back(loop[i]); faces.push_back(loop[i + 1]);
+                }
+                ++st.loops;
+            }
+        } else {
+            std::unordered_map<int, std::vector<int>> adj;
+            std::unordered_map<uint64_t, int> und;
+            for (size_t f = 0; f < faces.size() / 3; ++f)
+                for (int j = 0; j < 3; ++j) {
+                    int a = faces[3 * f + j], b = faces[3 * f + (j + 1) % 3];
+                    if (a > b) std::swap(a, b);
+                    und[ekey(a, b)]++;
+                }
+            for (const auto& kv : und) {
+                if (kv.second != 1) continue;
+                const int a = (int)(kv.first >> 32), b = (int)(uint32_t)kv.first;
+                adj[a].push_back(b); adj[b].push_back(a);
+            }
+            std::unordered_map<int, char> used;
+            for (const auto& kv : adj) {
+                const int start = kv.first;
+                if (used[start] || kv.second.size() != 2) continue;
+                std::vector<int> loop = {start};
+                int prev = start, cur = kv.second[0];
+                bool cycle = false, clean = true;
+                for (int steps = 0; steps <= max_loop; ++steps) {
+                    auto it = adj.find(cur);
+                    if (it == adj.end() || it->second.size() != 2 || used[cur]) { clean = false; break; }
+                    if (cur == start) { cycle = true; break; }
+                    loop.push_back(cur);
+                    const int nx = it->second[0] == prev ? it->second[1] : it->second[0];
+                    prev = cur; cur = nx;
+                }
+                for (int v : loop) used[v] = 1;
+                if (!clean || !cycle || loop.size() < 3) continue;
+                for (size_t i = 1; i + 1 < loop.size(); ++i) {
+                    faces.push_back(loop[0]); faces.push_back(loop[i]); faces.push_back(loop[i + 1]);
+                }
+                ++st.loops;
+            }
+        }
+    };
+    fill_loops(true);
+    fill_loops(false);
+    st.edges_after = count_open_edges(faces);
+    return st;
+}
+
+enum ShellFail { kKeep = 0, kCoverage = 1, kOpen = 2, kPieces = 3, kDropInterior = 4, kFloater = 5 };
 
 // Signed shell S replaces the unsigned double shell U only where S still covers
 // every outer vertex of U (within 1.5·eps), adds no open edges, and keeps that
@@ -764,6 +906,14 @@ Mesh choose_shell(Mesh U, Mesh S, const ExteriorGrid& grid, float eps, int band,
         printf("  remesh postproc: outer shell fallback component faces=%d reason=empty-signed\n", U.F());
         fflush(stdout);
         return U;
+    }
+    // Pinch seams are boundary loops where the inner and outer walls touched.
+    // Close those locally, then keep the component only if nothing is left open.
+    const RepairStats rep = close_boundary_loops(S.faces);
+    if (rep.edges_before > 0) {
+        printf("  remesh postproc: outer shell repair loops=%d edges %d -> %d\n",
+               rep.loops, rep.edges_before, rep.edges_after);
+        fflush(stdout);
     }
     std::vector<int> u_face, u_vert;
     const int nu = component_ids(U, u_face, u_vert);
@@ -835,7 +985,16 @@ Mesh choose_shell(Mesh U, Mesh S, const ExteriorGrid& grid, float eps, int band,
         unite(par, a, b);
         unite(par, b, c);
     }
-    std::vector<int> pieces((size_t)nu, 0);
+    std::vector<int> pieces((size_t)nu, 0), s_faces((size_t)nu, 0);
+    std::vector<float> cmin((size_t)nu * 3, 1e30f), cmax((size_t)nu * 3, -1e30f);
+    for (int i = 0; i < U.V(); ++i) {
+        const int c = u_vert[i];
+        if (c < 0 || c >= nu) continue;
+        for (int k = 0; k < 3; ++k) {
+            cmin[(size_t)c * 3 + k] = std::min(cmin[(size_t)c * 3 + k], U.verts[3 * i + k]);
+            cmax[(size_t)c * 3 + k] = std::max(cmax[(size_t)c * 3 + k], U.verts[3 * i + k]);
+        }
+    }
     for (int c = 0; c < nu; ++c) {
         if (why[c] == kDropInterior) continue;
         if (why[c] == kKeep && s_boundary[c] > u_boundary[c]) why[c] = kOpen;
@@ -848,11 +1007,51 @@ Mesh choose_shell(Mesh U, Mesh S, const ExteriorGrid& grid, float eps, int band,
             if (a < 0 || a >= S.V()) continue;
             roots[find_root(par, a)]++;
         }
+        s_faces[c] = assigned;
         int significant = 0;
         const int thresh = std::max(1, assigned / 50);
         for (const auto& kv : roots) if (kv.second >= thresh) ++significant;
         pieces[c] = significant;
         if (why[c] == kKeep && significant != 1) why[c] = kPieces;
+    }
+
+    // Same cuts as drop_pre_decimation_components, applied to the shell we are
+    // about to emit. Single-shelling must not push a piece that the double shell
+    // would have kept under the 2% cut, or under the 3% cut when it is detached.
+    {
+        const float voxel = grid.scale / (float)std::max(grid.res, 1);
+        auto proposed = [&](int c) -> int {
+            if (why[c] == kDropInterior) return 0;
+            if (why[c] == kKeep) return s_faces[c];
+            return u_faces[c];
+        };
+        auto box_gap = [&](int c, int body) -> float {
+            float acc = 0.f;
+            for (int k = 0; k < 3; ++k) {
+                const float lo = cmin[(size_t)c * 3 + k], hi = cmax[(size_t)c * 3 + k];
+                const float blo = cmin[(size_t)body * 3 + k], bhi = cmax[(size_t)body * 3 + k];
+                float d = 0.f;
+                if (hi < blo) d = blo - hi;
+                else if (lo > bhi) d = lo - bhi;
+                acc += d * d;
+            }
+            return std::sqrt(acc);
+        };
+        int largest = 0, body = 0;
+        for (int c = 0; c < nu; ++c) {
+            const int n = proposed(c);
+            if (n > largest) { largest = n; body = c; }
+        }
+        const int cut2 = (int)(0.02 * largest);
+        const int cut3 = (int)(0.03 * largest);
+        for (int c = 0; c < nu; ++c) {
+            if (why[c] != kKeep || c == body || largest <= 0) continue;
+            const int sf = s_faces[c], uf = u_faces[c];
+            if (uf < cut2) continue;
+            const bool lose2 = sf < cut2;
+            const bool lose3 = sf < cut3 && uf >= cut3 && box_gap(c, body) > 3.f * voxel;
+            if (lose2 || lose3) why[c] = kFloater;
+        }
     }
 
     bool any_keep = false, any_fallback = false;
@@ -862,15 +1061,19 @@ Mesh choose_shell(Mesh U, Mesh S, const ExteriorGrid& grid, float eps, int band,
             printf("  remesh postproc: outer shell dropped interior component faces=%d\n", u_faces[c]);
             continue;
         }
-        if (why[c] == kKeep) { any_keep = true; expect_largest = std::max(expect_largest, u_faces[c]); continue; }
+        const int out_faces = why[c] == kKeep ? s_faces[c] : u_faces[c];
+        expect_largest = std::max(expect_largest, out_faces);
+        if (why[c] == kKeep) { any_keep = true; continue; }
         any_fallback = true;
-        expect_largest = std::max(expect_largest, u_faces[c]);
-        if (why[c] == kCoverage) {
+        if (why[c] == kFloater) {
+            printf("  remesh postproc: outer shell keep double shell component faces=%d reason=floater-share signed=%d unsigned=%d\n",
+                   u_faces[c], s_faces[c], u_faces[c]);
+        } else if (why[c] == kCoverage) {
             printf("  remesh postproc: outer shell fallback component faces=%d reason=coverage misses=%d/%d max_gap=%.4g eps=%.4g\n",
                    u_faces[c], misses[c], checked[c], max_gap[c], eps);
         } else if (why[c] == kOpen) {
-            printf("  remesh postproc: outer shell fallback component faces=%d reason=open-edges %d (unsigned %d)\n",
-                   u_faces[c], s_boundary[c], u_boundary[c]);
+            printf("  remesh postproc: outer shell fallback component faces=%d reason=open-edges %d (unsigned %d) after repair loops=%d edges %d -> %d\n",
+                   u_faces[c], s_boundary[c], u_boundary[c], rep.loops, rep.edges_before, rep.edges_after);
         } else {
             printf("  remesh postproc: outer shell fallback component faces=%d reason=pieces signed=%d\n",
                    u_faces[c], pieces[c]);
@@ -882,7 +1085,8 @@ Mesh choose_shell(Mesh U, Mesh S, const ExteriorGrid& grid, float eps, int band,
         int n = 0;
         for (int c = 0; c < nu; ++c) {
             if (why[c] == kDropInterior) continue;
-            if (expect_largest > 0 && (int64_t)u_faces[c] * 50 >= expect_largest) ++n;
+            const int out_faces = why[c] == kKeep ? s_faces[c] : u_faces[c];
+            if (expect_largest > 0 && (int64_t)out_faces * 50 >= expect_largest) ++n;
         }
         return n;
     };

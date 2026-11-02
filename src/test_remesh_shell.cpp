@@ -760,6 +760,192 @@ void test_protrusions() {
         check(near_mesh(m, p, lim), "protrusions: undented outer face missing");
 }
 
+// Cube large enough that its surface sits in the boundary coarse blocks, with a
+// narrow deep recess on every face. The flood has to start on mixed boundary
+// blocks and walk into ±Z openings; otherwise the pocket is capped.
+void test_filled_cube_recesses() {
+    const float h = 0.48f;
+    const int n = 32;
+    const float spacing = 2.f * h / (float)n;
+    const float depth = 0.12f;
+    const float win = 0.55f * spacing;
+    const float mid = -h + ((float)n * 0.5f + 0.5f) * spacing;
+    Built b = make_cube(n, h, 0.f, 0.f, 0.f);
+    const char* names[3] = {"x", "y", "z"};
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int sign = -1; sign <= 1; sign += 2) {
+            const float face = (float)sign * h;
+            const float delta = (float)sign * -depth;
+            const int a = (axis + 1) % 3, c = (axis + 2) % 3;
+            shift_face(b.v, axis, face, a, mid, win, c, mid, win, delta);
+        }
+    }
+    std::printf("\n== filled-cube recesses h=%.2f depth=%.3f ==\n", h, depth);
+    check(boundary_edges(b.f) == 0, "filled-cube: input was opened");
+    const trellis::Mesh m = remesh(b.v, b.f);
+    const float eps = shell_eps();
+    std::printf("  [filled-cube] V=%d F=%d boundary=%d comps=%d\n",
+                m.V(), m.F(), boundary_edges(m.faces), component_count(m.faces, m.V()));
+    check(m.F() > 200, "filled-cube: empty shell");
+    check(boundary_edges(m.faces) == 0, "filled-cube: open edges");
+    check(component_count(m.faces, m.V()) == 1, "filled-cube: extra pieces");
+    check(signed_volume(m.verts, m.faces) > 0.0, "filled-cube: inward winding");
+    const int deep = deep_inside_box(m.verts, 0.f, 0.f, 0.f, h, 0.5f * eps);
+    std::printf("  [filled-cube] deep=%d / %d\n", deep, m.V());
+    check(deep * 8 < m.V(), "filled-cube: inner wall");
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int sign = -1; sign <= 1; sign += 2) {
+            float pocket[3] = {mid, mid, mid};
+            pocket[axis] = (float)sign * (h - 0.45f * depth);
+            float floorp[3] = {mid, mid, mid};
+            floorp[axis] = (float)sign * (h - depth + 0.5f * eps);
+            const int parity = parity_vote(m.verts, m.faces, pocket);
+            const bool floor_hit = near_mesh(m, floorp, 1.5f * eps);
+            std::printf("  [filled-cube] %c%c pocket_parity=%d floor=%d\n",
+                        sign > 0 ? '+' : '-', names[axis][0], parity, (int)floor_hit);
+            const std::string tag = std::string("filled-cube ") + (sign > 0 ? "+" : "-") + names[axis];
+            check(parity == 0, (tag + ": recess was capped").c_str());
+            check(floor_hit, (tag + ": recess floor missing").c_str());
+        }
+    }
+}
+
+// Lopsided double wall touched at several separated pinches, including ±Z.
+// One bridge is not enough: the signed shell has to close every pinch and
+// still drop about half the faces.
+void test_pinches() {
+    const float scale = (float)(kRes + 3 * kBand) / (float)kRes;
+    const float cell = scale / (float)kRes;
+    const float hx = 0.28f, hy = 0.10f, hz = 0.16f;
+    const float cx = 0.06f, cy = -0.04f, cz = 0.09f;
+    const float gap = 2.6f * cell;
+    const float touch = 0.30f * cell;
+    Built outer = make_box(10, hx, hy, hz, cx, cy, cz);
+    Built inner = make_box(8, hx - gap, hy - gap, hz - gap, cx, cy, cz);
+    const float ihy = hy - gap, ihz = hz - gap, ihx = hx - gap;
+    struct Pinch { int axis; int sign; float a0; float b0; };
+    const Pinch pinches[] = {
+        {0, +1, cy, cz},
+        {0, -1, cy + 0.02f, cz - 0.02f},
+        {1, +1, cx - 0.04f, cz + 0.03f},
+        {1, -1, cx + 0.03f, cz - 0.02f},
+        {2, +1, cx + 0.05f, cy - 0.02f},
+        {2, -1, cx - 0.04f, cy + 0.02f},
+    };
+    for (const Pinch& p : pinches) {
+        const int a = (p.axis + 1) % 3, b = (p.axis + 2) % 3;
+        const float half[3] = {ihx, ihy, ihz};
+        const float face = (p.axis == 0 ? cx : p.axis == 1 ? cy : cz) + (float)p.sign * half[p.axis];
+        const float outer_face = (p.axis == 0 ? cx : p.axis == 1 ? cy : cz) + (float)p.sign * (p.axis == 0 ? hx : p.axis == 1 ? hy : hz);
+        const float delta = (outer_face - (float)p.sign * touch) - face;
+        shift_face(inner.v, p.axis, face, a, p.a0, 1.2f * cell, b, p.b0, 1.2f * cell, delta);
+    }
+    const int base = (int)(outer.v.size() / 3);
+    append_mesh(outer, inner);
+    auto closest = [](const std::vector<float>& v, int lo, int hi, const float p[3]) {
+        int best = lo;
+        float best2 = 1e30f;
+        for (int i = lo; i < hi; ++i) {
+            const float d0 = v[3 * i] - p[0], d1 = v[3 * i + 1] - p[1], d2 = v[3 * i + 2] - p[2];
+            const float d = d0 * d0 + d1 * d1 + d2 * d2;
+            if (d < best2) { best2 = d; best = i; }
+        }
+        return best;
+    };
+    for (const Pinch& p : pinches) {
+        float q[3] = {cx, cy, cz};
+        const float outer_h[3] = {hx, hy, hz};
+        q[p.axis] = (p.axis == 0 ? cx : p.axis == 1 ? cy : cz) + (float)p.sign * (outer_h[p.axis] - touch);
+        q[(p.axis + 1) % 3] = p.a0;
+        q[(p.axis + 2) % 3] = p.b0;
+        const int iv = closest(outer.v, base, (int)(outer.v.size() / 3), q);
+        const int ov = closest(outer.v, 0, base, q);
+        const int iv2 = std::min(iv + 1, (int)(outer.v.size() / 3) - 1);
+        const int ov2 = std::min(ov + 1, base - 1);
+        outer.f.insert(outer.f.end(), {ov, ov2, iv, ov2, iv2, iv});
+    }
+    for (size_t i = 0; i + 5 < outer.f.size(); i += 6) std::swap(outer.f[i + 1], outer.f[i + 2]);
+    std::printf("\n== pinched lopsided shell (%zu pinches) ==\n", sizeof(pinches) / sizeof(pinches[0]));
+    trellis::Mesh m = remesh(outer.v, outer.f);
+    const int boundary_before = boundary_edges(m.faces);
+    trellis::clean_mesh(m.verts.data(), m.V(), m.faces);
+    const float eps = shell_eps();
+    const double area = 8.0 * ((double)hx * hy + (double)hy * hz + (double)hz * hx);
+    const double expect = 2.0 * area / ((double)cell * cell);
+    int deep = 0;
+    const float core[3] = {hx - gap - 0.4f * cell, hy - gap - 0.4f * cell, hz - gap - 0.4f * cell};
+    for (int i = 0; i < m.V(); ++i) {
+        const float d[3] = {std::fabs(m.verts[3 * i] - cx), std::fabs(m.verts[3 * i + 1] - cy),
+                            std::fabs(m.verts[3 * i + 2] - cz)};
+        if (d[0] < core[0] && d[1] < core[1] && d[2] < core[2]) ++deep;
+    }
+    int missed = 0, samples = 0;
+    const float c0[3] = {cx, cy, cz}, h0[3] = {hx, hy, hz};
+    for (int axis = 0; axis < 3; ++axis) for (int sign = -1; sign <= 1; sign += 2) {
+        float p[3] = {c0[0], c0[1], c0[2]};
+        p[axis] = c0[axis] + (float)sign * (h0[axis] + 0.85f * eps);
+        ++samples;
+        if (!near_mesh(m, p, 1.5f * eps)) ++missed;
+    }
+    std::printf("  [pinches] V=%d F=%d boundary=%d comps=%d deep=%d missed=%d/%d expect=%.0f outward=%.2f\n",
+                m.V(), m.F(), boundary_before, component_count(m.faces, m.V()), deep, missed, samples, expect,
+                outward_fraction(m.verts, m.faces));
+    check(m.F() > (int)(expect * 0.45f), "pinches: shell collapsed");
+    check(m.F() < (int)(expect * 1.55f), "pinches: inner wall was not removed");
+    check(boundary_before == 0, "pinches: open edges");
+    check(component_count(m.faces, m.V()) == 1, "pinches: extra pieces");
+    check(signed_volume(m.verts, m.faces) > 0.0, "pinches: inward winding");
+    check(outward_fraction(m.verts, m.faces) > 0.75, "pinches: outward area does not dominate");
+    check(deep == 0, "pinches: vertices inside the sealed cavity");
+    check(missed == 0, "pinches: outer sheet not covered within 1.5 eps");
+}
+
+// Open body stays a double wall (it does not seal). A small closed foot
+// single-shells. That must not push the foot under the 2%/3% floater cuts
+// while the body is still the large double wall.
+void test_floater_share() {
+    const float scale = (float)(kRes + 3 * kBand) / (float)kRes;
+    const float cell = scale / (float)kRes;
+    Built body = make_cube(10, 0.30f, -0.15f, 0.f, 0.f);
+    std::vector<int32_t> kept;
+    kept.reserve(body.f.size());
+    for (size_t i = 0; i + 2 < body.f.size(); i += 3) {
+        const float z = (body.v[3 * body.f[i] + 2] + body.v[3 * body.f[i + 1] + 2] + body.v[3 * body.f[i + 2] + 2]) / 3.f;
+        if (z > 0.28f) continue;
+        kept.insert(kept.end(), {body.f[i], body.f[i + 1], body.f[i + 2]});
+    }
+    body.f.swap(kept);
+    // Hollow foot, walls close enough to share the unsigned component when they
+    // pinch, far enough from the body that a halved shell falls under 2%.
+    // Single shell stays above the 2% cut. A component whose unsigned face count
+    // is over the cut and whose signed count is under it keeps the double shell
+    // (reason=floater-share) so this filter still sees it.
+    const float fh = 0.055f;
+    const float gap = 0.55f * cell;
+    const float fcx = 0.40f;
+    Built foot = make_cube(6, fh, fcx, 0.f, 0.f);
+    Built foot_in = make_cube(4, std::max(0.02f, fh - gap), fcx, 0.f, 0.f);
+    shift_face(foot_in.v, 0, fcx + (fh - gap), 1, 0.f, 0.02f, 2, 0.f, 0.02f, gap);
+    const int base = (int)(body.v.size() / 3);
+    append_mesh(body, foot);
+    const int ibase = (int)(body.v.size() / 3);
+    append_mesh(body, foot_in);
+    body.f.insert(body.f.end(), {base, base + 1, ibase, base + 1, ibase + 1, ibase});
+    std::printf("\n== floater share (open body + hollow foot) ==\n");
+    trellis::Mesh m = remesh(body.v, body.f);
+    const float eps = shell_eps();
+    const int before_foot = count_x(m.verts, 0.28f, 0.46f);
+    const int deep_foot = deep_inside_box(m.verts, fcx, 0.f, 0.f, fh, 0.4f * eps);
+    std::printf("  [floater] V=%d F=%d comps=%d foot_verts=%d deep_foot=%d\n",
+                m.V(), m.F(), component_count(m.faces, m.V()), before_foot, deep_foot);
+    check(before_foot > 20, "floater: foot missing before the filter");
+    const float voxel = trellis::remesh_voxel_world(kRes, kBand);
+    const int dropped = trellis::drop_pre_decimation_components(m.verts, m.faces, voxel);
+    const int after_foot = count_x(m.verts, 0.28f, 0.46f);
+    std::printf("  [floater] dropped=%d foot_verts %d -> %d\n", dropped, before_foot, after_foot);
+    check(after_foot > 20, "floater: shell change put the foot under the 2%/3% cut");
+}
+
 void test_clean_restores_outward() {
     Built b = make_cube(10, 0.25f, 0.f, 0.f, 0.f);
     trellis::Mesh m = remesh(b.v, b.f);
@@ -795,6 +981,9 @@ int main() {
     test_lopsided(false);
     test_lopsided(true);
     test_protrusions();
+    test_filled_cube_recesses();
+    test_pinches();
+    test_floater_share();
     test_clean_restores_outward();
     if (g_fails) {
         std::fprintf(stderr, "\n%d check(s) failed\n", g_fails);
