@@ -75,6 +75,37 @@ Built make_cube(int n, float h, float cx, float cy, float cz) {
     return b;
 }
 
+// Axis-aligned box with independent half-extents. A cube is symmetric in x and
+// z, so it cannot catch a flood that swaps those axes.
+Built make_box(int n, float hx, float hy, float hz, float cx, float cy, float cz) {
+    Built b;
+    b.n = n;
+    b.h = hx;
+    const int N = n + 1;
+    b.v.reserve((size_t)N * N * N * 3);
+    for (int k = 0; k < N; ++k)
+        for (int j = 0; j < N; ++j)
+            for (int i = 0; i < N; ++i) {
+                b.v.push_back(cx + (-hx + 2.f * hx * (float)i / (float)n));
+                b.v.push_back(cy + (-hy + 2.f * hy * (float)j / (float)n));
+                b.v.push_back(cz + (-hz + 2.f * hz * (float)k / (float)n));
+            }
+    auto id = [N](int i, int j, int k) { return (k * N + j) * N + i; };
+    for (int j = 0; j < n; ++j) for (int k = 0; k < n; ++k) {
+        add_quad(b.f, id(n, j, k), id(n, j + 1, k), id(n, j + 1, k + 1), id(n, j, k + 1));
+        add_quad(b.f, id(0, j, k), id(0, j, k + 1), id(0, j + 1, k + 1), id(0, j + 1, k));
+    }
+    for (int i = 0; i < n; ++i) for (int k = 0; k < n; ++k) {
+        add_quad(b.f, id(i, n, k), id(i, n, k + 1), id(i + 1, n, k + 1), id(i + 1, n, k));
+        add_quad(b.f, id(i, 0, k), id(i + 1, 0, k), id(i + 1, 0, k + 1), id(i, 0, k + 1));
+    }
+    for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) {
+        add_quad(b.f, id(i, j, n), id(i + 1, j, n), id(i + 1, j + 1, n), id(i, j + 1, n));
+        add_quad(b.f, id(i, j, 0), id(i, j + 1, 0), id(i + 1, j + 1, 0), id(i + 1, j, 0));
+    }
+    return b;
+}
+
 void flip_faces(std::vector<int32_t>& f) {
     for (size_t i = 0; i + 2 < f.size(); i += 3) std::swap(f[i + 1], f[i + 2]);
 }
@@ -91,6 +122,19 @@ void move_plus_x(Built& b, float cy, float cz, float ywin, float zwin, float new
         const int vi = (k * N + j) * N + b.n;
         const float y = b.v[3 * vi + 1], z = b.v[3 * vi + 2];
         if (std::fabs(y - cy) <= ywin && std::fabs(z - cz) <= zwin) b.v[3 * vi] = new_x;
+    }
+}
+
+// Move vertices that sit on `face` along `axis` and inside the window on the
+// other two axes. `a`/`b` are those axes.
+void shift_face(std::vector<float>& v, int axis, float face,
+                int a, float a0, float aw, int b, float b0, float bw, float delta) {
+    const int n = (int)v.size() / 3;
+    for (int i = 0; i < n; ++i) {
+        float* p = &v[3 * i];
+        if (std::fabs(p[axis] - face) > 1e-5f) continue;
+        if (std::fabs(p[a] - a0) > aw || std::fabs(p[b] - b0) > bw) continue;
+        p[axis] += delta;
     }
 }
 
@@ -227,6 +271,17 @@ int deep_inside_box(const std::vector<float>& v, float cx, float cy, float cz, f
         if (m < lim) ++n;
     }
     return n;
+}
+
+bool near_mesh(const trellis::Mesh& m, const float p[3], float lim) {
+    const float lim2 = lim * lim;
+    for (int i = 0; i < m.V(); ++i) {
+        const float d0 = m.verts[3 * i] - p[0];
+        const float d1 = m.verts[3 * i + 1] - p[1];
+        const float d2 = m.verts[3 * i + 2] - p[2];
+        if (d0 * d0 + d1 * d1 + d2 * d2 <= lim2) return true;
+    }
+    return false;
 }
 
 int count_x(const std::vector<float>& v, float x0, float x1) {
@@ -408,7 +463,7 @@ void test_recess() {
         if (x < -0.02f && mc < h - 0.5f * shell_eps()) ++deep_back;
     }
     std::printf("  [recess] deep_back=%d / %d\n", deep_back, m.V());
-    check(deep_back * 8 < m.V(), "recess: inner wall behind the undented face");
+    check(deep_back == 0, "recess: inner wall behind the undented face");
     (void)eps;
 }
 
@@ -575,6 +630,136 @@ void test_hollow_band(bool invert) {
     (void)eps;
 }
 
+// Off-center hollow box, long in x and short in y, so an x/z swap in the flood
+// cannot hide behind symmetry. The outer sheet of the unsigned tube is the
+// surface just outside each input face; the inner wall is not.
+void test_lopsided(bool invert) {
+    const float scale = (float)(kRes + 3 * kBand) / (float)kRes;
+    const float cell = scale / (float)kRes;
+    const float hx = 0.28f, hy = 0.09f, hz = 0.16f;
+    const float cx = 0.07f, cy = -0.05f, cz = 0.11f;
+    const float gap = 2.6f * cell;
+    Built mesh = make_box(10, hx, hy, hz, cx, cy, cz);
+    const int base = (int)(mesh.v.size() / 3);
+    append_mesh(mesh, make_box(8, hx - gap, hy - gap, hz - gap, cx, cy, cz));
+    mesh.f.insert(mesh.f.end(), {0, 1, base, 1, base + 1, base});
+    if (invert) flip_faces(mesh.f);
+    else {
+        for (size_t i = 0; i + 5 < mesh.f.size(); i += 6) std::swap(mesh.f[i + 1], mesh.f[i + 2]);
+    }
+    std::printf("\n== lopsided hollow %s (hx %.2f hy %.2f hz %.2f) ==\n",
+                invert ? "inverted" : "garbled", hx, hy, hz);
+    trellis::Mesh m = remesh(mesh.v, mesh.f);
+    const int boundary_before = boundary_edges(m.faces);
+    const int comps_before = component_count(m.faces, m.V());
+    trellis::clean_mesh(m.verts.data(), m.V(), m.faces);
+    const float eps = shell_eps();
+    float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
+    for (int i = 0; i < m.V(); ++i) for (int k = 0; k < 3; ++k) {
+        mn[k] = std::min(mn[k], m.verts[3 * i + k]);
+        mx[k] = std::max(mx[k], m.verts[3 * i + k]);
+    }
+    int deep = 0;
+    const float core[3] = {hx - gap - 0.4f * cell, hy - gap - 0.4f * cell, hz - gap - 0.4f * cell};
+    for (int i = 0; i < m.V(); ++i) {
+        const float d[3] = {std::fabs(m.verts[3 * i] - cx), std::fabs(m.verts[3 * i + 1] - cy),
+                            std::fabs(m.verts[3 * i + 2] - cz)};
+        if (d[0] < core[0] && d[1] < core[1] && d[2] < core[2]) ++deep;
+    }
+    const float c0[3] = {cx, cy, cz}, h0[3] = {hx, hy, hz};
+    int missed = 0, samples = 0;
+    const float lim = 1.5f * eps;
+    for (int axis = 0; axis < 3; ++axis) for (int sign = -1; sign <= 1; sign += 2) {
+        const int a = (axis + 1) % 3, b = (axis + 2) % 3;
+        for (int iu = 0; iu < 3; ++iu) for (int iv = 0; iv < 3; ++iv) {
+            float p[3] = {c0[0], c0[1], c0[2]};
+            p[axis] = c0[axis] + (float)sign * (h0[axis] + 0.85f * eps);
+            p[a] = c0[a] + h0[a] * (-0.5f + 0.5f * (float)iu);
+            p[b] = c0[b] + h0[b] * (-0.5f + 0.5f * (float)iv);
+            ++samples;
+            if (!near_mesh(m, p, lim)) ++missed;
+        }
+    }
+    const double area = 8.0 * ((double)hx * hy + (double)hy * hz + (double)hz * hx);
+    const double expect = 2.0 * area / ((double)cell * cell);
+    const char* name = invert ? "lopsided-inv" : "lopsided";
+    std::printf("  [%s] V=%d F=%d boundary=%d comps=%d deep=%d missed=%d/%d expect=%.0f vol=%.4g outward=%.2f\n",
+                name, m.V(), m.F(), boundary_before, comps_before, deep, missed, samples, expect,
+                signed_volume(m.verts, m.faces), outward_fraction(m.verts, m.faces));
+    std::printf("  [%s] span x [%.3f, %.3f] y [%.3f, %.3f] z [%.3f, %.3f]\n",
+                name, mn[0], mx[0], mn[1], mx[1], mn[2], mx[2]);
+    check(m.F() > (int)(expect * 0.45), (std::string(name) + ": shell collapsed").c_str());
+    check(m.F() < (int)(expect * 1.55), (std::string(name) + ": inner wall was not removed").c_str());
+    check(boundary_before == 0, (std::string(name) + ": open edges").c_str());
+    check(boundary_edges(m.faces) == 0, (std::string(name) + ": clean opened edges").c_str());
+    check(comps_before == 1, (std::string(name) + ": extra pieces").c_str());
+    check(signed_volume(m.verts, m.faces) > 0.0, (std::string(name) + ": inward winding").c_str());
+    check(outward_fraction(m.verts, m.faces) > 0.75, (std::string(name) + ": outward area does not dominate").c_str());
+    check(deep == 0, (std::string(name) + ": vertices inside the sealed cavity").c_str());
+    check(missed == 0, (std::string(name) + ": outer sheet not covered within 1.5 eps").c_str());
+    check(mx[0] > cx + hx + 0.25f * eps, (std::string(name) + ": +x outer face missing").c_str());
+    check(mn[0] < cx - hx - 0.25f * eps, (std::string(name) + ": -x outer face missing").c_str());
+    check(mx[1] > cy + hy + 0.25f * eps, (std::string(name) + ": +y outer face missing").c_str());
+    check(mn[1] < cy - hy - 0.25f * eps, (std::string(name) + ": -y outer face missing").c_str());
+    check(mx[2] > cz + hz + 0.25f * eps, (std::string(name) + ": +z outer face missing").c_str());
+    check(mn[2] < cz - hz - 0.25f * eps, (std::string(name) + ": -z outer face missing").c_str());
+}
+
+// Foot, horn, and eyeball on one off-center cube. Each tip is several cells
+// outside the box; the remesh must keep all three and still drop the inner wall.
+void test_protrusions() {
+    const float h = 0.20f;
+    const float cx = 0.03f, cy = -0.04f, cz = 0.05f;
+    Built b = make_cube(16, h, cx, cy, cz);
+    const float spacing = 2.f * h / 16.f;
+    const float eps = shell_eps();
+    const float foot = 7.f * spacing;
+    const float horn = 8.f * spacing;
+    const float eye = 4.5f * spacing;
+    const float foot_x = cx + 0.08f, foot_z = cz + 0.03f;
+    const float horn_x = cx - 0.07f, horn_y = cy + 0.02f;
+    const float eye_y = cy + 0.06f, eye_z = cz - 0.05f;
+    shift_face(b.v, 1, cy - h, 0, foot_x, spacing * 0.55f, 2, foot_z, spacing * 0.55f, -foot);
+    shift_face(b.v, 2, cz + h, 0, horn_x, spacing * 0.55f, 1, horn_y, spacing * 0.55f, horn);
+    shift_face(b.v, 0, cx + h, 1, eye_y, spacing * 1.15f, 2, eye_z, spacing * 1.15f, eye);
+    float in_min_y = 1e30f, in_max_z = -1e30f, in_max_x = -1e30f;
+    for (size_t i = 0; i + 2 < b.v.size(); i += 3) {
+        in_min_y = std::min(in_min_y, b.v[i + 1]);
+        in_max_z = std::max(in_max_z, b.v[i + 2]);
+        in_max_x = std::max(in_max_x, b.v[i]);
+    }
+    std::printf("\n== foot/horn/eye input tips y=%.3f z=%.3f x=%.3f ==\n", in_min_y, in_max_z, in_max_x);
+    check(in_min_y < cy - h - 0.8f * foot, "protrusions: foot was not pushed");
+    check(in_max_z > cz + h + 0.8f * horn, "protrusions: horn was not pushed");
+    check(in_max_x > cx + h + 0.8f * eye, "protrusions: eye was not pushed");
+    const trellis::Mesh m = remesh(b.v, b.f);
+    const float foot_tip[3] = {foot_x, cy - h - foot, foot_z};
+    const float horn_tip[3] = {horn_x, horn_y, cz + h + horn};
+    const float eye_tip[3] = {cx + h + eye, eye_y, eye_z};
+    const float lim = 1.5f * eps;
+    const int deep = deep_inside_box(m.verts, cx, cy, cz, h, 0.45f * eps);
+    std::printf("  [protrusions] V=%d F=%d boundary=%d comps=%d deep=%d foot=%d horn=%d eye=%d\n",
+                m.V(), m.F(), boundary_edges(m.faces), component_count(m.faces, m.V()), deep,
+                (int)near_mesh(m, foot_tip, lim), (int)near_mesh(m, horn_tip, lim), (int)near_mesh(m, eye_tip, lim));
+    check(m.F() > 200, "protrusions: empty shell");
+    check(boundary_edges(m.faces) == 0, "protrusions: open edges");
+    check(component_count(m.faces, m.V()) == 1, "protrusions: extra pieces");
+    check(signed_volume(m.verts, m.faces) > 0.0, "protrusions: inward winding");
+    check(deep == 0, "protrusions: inner wall inside the cube");
+    check(near_mesh(m, foot_tip, lim), "protrusions: foot tip farther than 1.5 eps from the shell");
+    check(near_mesh(m, horn_tip, lim), "protrusions: horn tip farther than 1.5 eps from the shell");
+    check(near_mesh(m, eye_tip, lim), "protrusions: eye bump farther than 1.5 eps from the shell");
+    // Undented face centers stay on the outer sheet too (a gash would miss them).
+    const float faces[4][3] = {
+        {cx - h - 0.85f * eps, cy, cz},
+        {cx, cy + h + 0.85f * eps, cz},
+        {cx, cy - h - 0.85f * eps, cz + 0.06f},
+        {cx, cy, cz - h - 0.85f * eps},
+    };
+    for (const auto& p : faces)
+        check(near_mesh(m, p, lim), "protrusions: undented outer face missing");
+}
+
 void test_clean_restores_outward() {
     Built b = make_cube(10, 0.25f, 0.f, 0.f, 0.f);
     trellis::Mesh m = remesh(b.v, b.f);
@@ -607,6 +792,9 @@ int main() {
     test_bodies();
     test_hollow_band(false);
     test_hollow_band(true);
+    test_lopsided(false);
+    test_lopsided(true);
+    test_protrusions();
     test_clean_restores_outward();
     if (g_fails) {
         std::fprintf(stderr, "\n%d check(s) failed\n", g_fails);

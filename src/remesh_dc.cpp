@@ -1,6 +1,5 @@
 #include "remesh_dc.h"
 #include "tri_bvh.h"
-#include "uv_bake.h"
 #include <algorithm>
 #include <atomic>
 #ifdef _MSC_VER
@@ -106,8 +105,22 @@ struct ExteriorGrid {
     int res = 0;
     float scale = 1.f;
     bool ready = false;
+    double seal_s = 0;
+    double flood_s = 0;
+    // Inclusive cell range of the input vertices. Cells strictly outside this
+    // box cannot be inside the solid.
+    int amin[3] = {0, 0, 0};
+    int amax[3] = {-1, -1, -1};
+    // Coarse empty-region labels. 0 = sealed inside, 1 = surface (use the fine
+    // bitset), 2 = empty and reachable from outside the grid. Block size 4 keeps
+    // the volume flood on a 4³-smaller grid; the fine flood stays in the surface
+    // blocks only.
+    static constexpr int kCoarse = 4;
+    int cn = 0;
+    std::vector<uint8_t> ckind;
     std::vector<uint64_t> blocked;
     std::vector<uint64_t> exterior;
+    std::vector<int64_t> blocked_ids;
 
     int64_t ncells() const { return (int64_t)res * res * res; }
     int64_t index(int x, int y, int z) const {
@@ -123,17 +136,79 @@ struct ExteriorGrid {
         const int64_t i = index(x, y, z);
         return ((bits[(size_t)(i >> 6)] >> (unsigned)(i & 63)) & 1ull) != 0;
     }
+    // First write records the id so sealing can walk the surface, not res³.
+    bool mark_blocked(int x, int y, int z) {
+        if ((unsigned)x >= (unsigned)res || (unsigned)y >= (unsigned)res || (unsigned)z >= (unsigned)res) return false;
+        const int64_t i = index(x, y, z);
+        uint64_t& w = blocked[(size_t)(i >> 6)];
+        const uint64_t mask = 1ull << (unsigned)(i & 63);
+        if (w & mask) return false;
+        w |= mask;
+        blocked_ids.push_back(i);
+        return true;
+    }
     void to_grid(const float p[3], float g[3]) const {
         for (int k = 0; k < 3; ++k) g[k] = (p[k] / scale + 0.5f) * (float)res;
     }
-    // Flooded cell, or a blocked surface cell that touches the flood (so a
-    // thick surface voxel does not swallow the outer offset).
-    bool outside_cell(int x, int y, int z) const {
-        if (getb(exterior, x, y, z)) return true;
-        if (!getb(blocked, x, y, z)) return false;
+    bool cell_oob(int x, int y, int z) const {
+        return (unsigned)x >= (unsigned)res || (unsigned)y >= (unsigned)res || (unsigned)z >= (unsigned)res;
+    }
+    bool outside_aabb_cell(int x, int y, int z) const {
+        return x < amin[0] || x > amax[0] || y < amin[1] || y > amax[1] || z < amin[2] || z > amax[2];
+    }
+    int coarse_index(int x, int y, int z) const {
+        const int cx = x / kCoarse, cy = y / kCoarse, cz = z / kCoarse;
+        return (cx * cn + cy) * cn + cz;
+    }
+    // Empty coarse cell already proven reachable from outside the grid.
+    bool coarse_out(int x, int y, int z) const {
+        if (cn <= 0 || cell_oob(x, y, z)) return false;
+        const int cx = x / kCoarse, cy = y / kCoarse, cz = z / kCoarse;
+        if ((unsigned)cx >= (unsigned)cn || (unsigned)cy >= (unsigned)cn || (unsigned)cz >= (unsigned)cn)
+            return false;
+        return ckind[(size_t)coarse_index(x, y, z)] == 2;
+    }
+    bool coarse_mixed(int x, int y, int z) const {
+        if (cn <= 0 || cell_oob(x, y, z)) return false;
+        return ckind[(size_t)coarse_index(x, y, z)] == 1;
+    }
+    bool reached_out(int x, int y, int z) const {
+        if (cell_oob(x, y, z) || outside_aabb_cell(x, y, z)) return true;
+        if (getb(exterior, x, y, z) || coarse_out(x, y, z)) return true;
+        return false;
+    }
+    // A surface voxel is outside only on the side that faces the flood. Treating
+    // the whole voxel as outside pulls inner-wall samples onto the outer sheet.
+    bool blocked_outside(int x, int y, int z, const float g[3]) const {
         static const int D[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
-        for (int i = 0; i < 6; ++i)
-            if (getb(exterior, x + D[i][0], y + D[i][1], z + D[i][2])) return true;
+        const float frac[3] = {g[0] - (float)x, g[1] - (float)y, g[2] - (float)z};
+        float best_ext = 1e30f, best_in = 1e30f;
+        for (int i = 0; i < 6; ++i) {
+            const int nx = x + D[i][0], ny = y + D[i][1], nz = z + D[i][2];
+            const int ax = i >> 1;
+            const float face_dist = (i & 1) ? frac[ax] : (1.f - frac[ax]);
+            const bool ext = reached_out(nx, ny, nz);
+            if (ext) best_ext = std::min(best_ext, face_dist);
+            else if (!getb(blocked, nx, ny, nz)) best_in = std::min(best_in, face_dist);
+        }
+        if (best_ext >= 1e29f) return false;
+        if (best_in >= 1e29f) return true;
+        return best_ext <= best_in;
+    }
+    bool outside_cell(int x, int y, int z, const float g[3]) const {
+        if (cell_oob(x, y, z)) return true;
+        if (outside_aabb_cell(x, y, z)) return true;
+        if (!getb(blocked, x, y, z) && coarse_out(x, y, z)) return true;
+        if (getb(exterior, x, y, z)) return true;
+        if (cn > 0 && !coarse_mixed(x, y, z) && !getb(blocked, x, y, z)) return false;
+        if (getb(blocked, x, y, z)) return blocked_outside(x, y, z, g);
+        // One-cell halo of the flooded surface. A sealed cavity is not adjacent
+        // to a flooded cell; deep exterior is a coarse-outside block.
+        static const int D[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+        for (int i = 0; i < 6; ++i) {
+            const int nx = x + D[i][0], ny = y + D[i][1], nz = z + D[i][2];
+            if (reached_out(nx, ny, nz)) return true;
+        }
         return false;
     }
     bool is_outside(const float p[3]) const {
@@ -147,7 +222,7 @@ struct ExteriorGrid {
             if (i >= res) i = res - 1;
             base[k] = i;
         }
-        if (outside_cell(base[0], base[1], base[2])) return true;
+        if (outside_cell(base[0], base[1], base[2], g)) return true;
         // Grid vertices land on a cell corner. Look at the cell on the other
         // side of that plane too, so the corner isn't inside just because
         // floor() picked the inward cell.
@@ -156,7 +231,7 @@ struct ExteriorGrid {
             if (frac > 1e-3f && frac < 1.f - 1e-3f) continue;
             int nb[3] = {base[0], base[1], base[2]};
             nb[k] += (frac < 0.5f) ? -1 : 1;
-            if (outside_cell(nb[0], nb[1], nb[2])) return true;
+            if (outside_cell(nb[0], nb[1], nb[2], g)) return true;
         }
         return false;
     }
@@ -186,7 +261,7 @@ struct ExteriorGrid {
                     for (int z = c0[2]; z <= c1[2]; ++z) {
                         const float bmin[3] = {(float)x - grow, (float)y - grow, (float)z - grow};
                         const float bmax[3] = {(float)x + 1.f + grow, (float)y + 1.f + grow, (float)z + 1.f + grow};
-                        if (tri_hits_box(g[0], g[1], g[2], bmin, bmax)) setb(blocked, x, y, z);
+                        if (tri_hits_box(g[0], g[1], g[2], bmin, bmax)) mark_blocked(x, y, z);
                     }
             // Sample the triangle interior so a long thin face cannot skip a cell
             // the separating-axis test misses.
@@ -207,95 +282,199 @@ struct ExteriorGrid {
                     c[k] = (int)std::floor(p);
                     if ((unsigned)c[k] >= (unsigned)res) okc = false;
                 }
-                if (okc) setb(blocked, c[0], c[1], c[2]);
+                if (okc) mark_blocked(c[0], c[1], c[2]);
             }
         }
     }
 
-    // Close single-cell cracks in the blocker so a watertight mesh cannot leak
-    // the flood through a diagonal gap. Wider openings (a real hole, a recess)
-    // stay open and the flood walks through them.
+    // Close single-cell cracks between blocked surface cells so a watertight
+    // mesh cannot leak the flood through a one-cell gap. Only the blocked-cell
+    // list is visited — never the dense res³ grid. Wider openings (a real hole,
+    // a recess, a gap between feet) stay open.
     void seal_cracks() {
-        const std::vector<uint64_t> src = blocked;
-        for (int axis = 0; axis < 3; ++axis) {
-            for (int z = 0; z < res; ++z)
-                for (int y = 0; y < res; ++y)
-                    for (int x = 0; x < res; ++x) {
-                        int a[3] = {x, y, z};
-                        if (a[axis] + 2 >= res) continue;
-                        int b[3] = {x, y, z};
-                        int m[3] = {x, y, z};
-                        b[axis] += 2;
-                        m[axis] += 1;
-                        if (getb(src, a[0], a[1], a[2]) && getb(src, b[0], b[1], b[2]) &&
-                            !getb(blocked, m[0], m[1], m[2]))
-                            setb(blocked, m[0], m[1], m[2]);
-                    }
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t n = blocked_ids.size();
+        const int64_t plane = (int64_t)res * res;
+        std::vector<int> fill;
+        fill.reserve(n / 4 + 16);
+        static const int D[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+        for (size_t s = 0; s < n; ++s) {
+            const int64_t id = blocked_ids[s];
+            const int x = (int)(id / plane);
+            const int y = (int)((id / res) % res);
+            const int z = (int)(id % res);
+            for (int a = 0; a < 3; ++a) {
+                const int x2 = x + 2 * D[a][0], y2 = y + 2 * D[a][1], z2 = z + 2 * D[a][2];
+                const int xm = x + D[a][0], ym = y + D[a][1], zm = z + D[a][2];
+                if (getb(blocked, x2, y2, z2) && !getb(blocked, xm, ym, zm)) {
+                    fill.push_back(xm); fill.push_back(ym); fill.push_back(zm);
+                }
+            }
         }
+        for (size_t i = 0; i + 2 < fill.size(); i += 3) mark_blocked(fill[i], fill[i + 1], fill[i + 2]);
+        seal_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
 
-    void flood() {
-        std::vector<int64_t> st;
-        st.reserve(4096);
-        auto push_empty = [&](int x, int y, int z) {
-            if ((unsigned)x >= (unsigned)res || (unsigned)y >= (unsigned)res || (unsigned)z >= (unsigned)res) return;
-            if (getb(blocked, x, y, z) || getb(exterior, x, y, z)) return;
-            st.push_back(index(x, y, z));
-        };
-        for (int y = 0; y < res; ++y) for (int z = 0; z < res; ++z) {
-            push_empty(0, y, z);
-            push_empty(res - 1, y, z);
-        }
-        for (int x = 0; x < res; ++x) for (int z = 0; z < res; ++z) {
-            push_empty(x, 0, z);
-            push_empty(x, res - 1, z);
-        }
-        for (int x = 0; x < res; ++x) for (int y = 0; y < res; ++y) {
-            push_empty(x, y, 0);
-            push_empty(x, y, res - 1);
-        }
+    // id = x*res^2 + y*res + z. x is the high axis; z is the low bits.
+    void decode_id(int64_t id, int& x, int& y, int& z) const {
         const int64_t plane = (int64_t)res * res;
+        x = (int)(id / plane);
+        y = (int)((id / res) % res);
+        z = (int)(id % res);
+    }
+
+    // Reachability from outside the grid. Empty 4^3 blocks flood on the coarse
+    // grid (so the deep exterior is not walked cell by cell). The fine flood
+    // stays inside surface blocks, which is what keeps a sealed cavity inside
+    // and still reaches a second body sitting in that exterior.
+    void flood() {
+        const auto t0 = std::chrono::steady_clock::now();
+        cn = (res + kCoarse - 1) / kCoarse;
+        ckind.assign((size_t)cn * cn * cn, 0);
+        std::vector<int> mixed;
+        mixed.reserve(blocked_ids.size() / 8 + 16);
+        for (int64_t id : blocked_ids) {
+            int x, y, z;
+            decode_id(id, x, y, z);
+            const int ci = coarse_index(x, y, z);
+            if (ckind[(size_t)ci] == 0) {
+                ckind[(size_t)ci] = 1;
+                mixed.push_back(ci);
+            }
+        }
+        auto c_oob = [&](int cx, int cy, int cz) {
+            return (unsigned)cx >= (unsigned)cn || (unsigned)cy >= (unsigned)cn || (unsigned)cz >= (unsigned)cn;
+        };
+        auto c_at = [&](int cx, int cy, int cz) { return (cx * cn + cy) * cn + cz; };
+        std::vector<int> cq;
+        cq.reserve(1024);
+        auto cpush = [&](int cx, int cy, int cz) {
+            if (c_oob(cx, cy, cz)) return;
+            const int ci = c_at(cx, cy, cz);
+            if (ckind[(size_t)ci] != 0) return;
+            ckind[(size_t)ci] = 2;
+            cq.push_back(ci);
+        };
+        for (int cy = 0; cy < cn; ++cy) for (int cz = 0; cz < cn; ++cz) {
+            cpush(0, cy, cz);
+            cpush(cn - 1, cy, cz);
+        }
+        for (int cx = 0; cx < cn; ++cx) for (int cz = 0; cz < cn; ++cz) {
+            cpush(cx, 0, cz);
+            cpush(cx, cn - 1, cz);
+        }
+        for (int cx = 0; cx < cn; ++cx) for (int cy = 0; cy < cn; ++cy) {
+            cpush(cx, cy, 0);
+            cpush(cx, cy, cn - 1);
+        }
+        static const int D[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+        auto c_drain = [&]() {
+            while (!cq.empty()) {
+                const int ci = cq.back();
+                cq.pop_back();
+                const int cx = ci / (cn * cn);
+                const int cy = (ci / cn) % cn;
+                const int cz = ci % cn;
+                for (int i = 0; i < 6; ++i) cpush(cx + D[i][0], cy + D[i][1], cz + D[i][2]);
+            }
+        };
+        c_drain();
+
+        auto allow = [&](int x, int y, int z) -> bool {
+            return !cell_oob(x, y, z) && coarse_mixed(x, y, z) &&
+                   !getb(blocked, x, y, z) && !getb(exterior, x, y, z);
+        };
+        std::vector<int> st;
+        st.reserve(4096);
+        auto push = [&](int x, int y, int z) {
+            if (!allow(x, y, z)) return;
+            st.push_back(x); st.push_back(y); st.push_back(z);
+        };
+        for (int ci : mixed) {
+            const int cx = ci / (cn * cn);
+            const int cy = (ci / cn) % cn;
+            const int cz = ci % cn;
+            const int x0 = cx * kCoarse, y0 = cy * kCoarse, z0 = cz * kCoarse;
+            const int x1 = std::min(res, x0 + kCoarse) - 1;
+            const int y1 = std::min(res, y0 + kCoarse) - 1;
+            const int z1 = std::min(res, z0 + kCoarse) - 1;
+            for (int i = 0; i < 6; ++i) {
+                const int nx = cx + D[i][0], ny = cy + D[i][1], nz = cz + D[i][2];
+                if (c_oob(nx, ny, nz) || ckind[(size_t)c_at(nx, ny, nz)] != 2) continue;
+                int fx0 = x0, fy0 = y0, fz0 = z0, fx1 = x1, fy1 = y1, fz1 = z1;
+                if (D[i][0] > 0) fx0 = fx1 = x1;
+                else if (D[i][0] < 0) fx0 = fx1 = x0;
+                if (D[i][1] > 0) fy0 = fy1 = y1;
+                else if (D[i][1] < 0) fy0 = fy1 = y0;
+                if (D[i][2] > 0) fz0 = fz1 = z1;
+                else if (D[i][2] < 0) fz0 = fz1 = z0;
+                for (int x = fx0; x <= fx1; ++x)
+                    for (int y = fy0; y <= fy1; ++y)
+                        for (int z = fz0; z <= fz1; ++z) push(x, y, z);
+            }
+        }
         while (!st.empty()) {
-            const int64_t id = st.back();
-            st.pop_back();
-            const int z = (int)(id / plane);
-            const int y = (int)((id / res) % res);
-            const int x = (int)(id % res);
-            if (getb(exterior, x, y, z) || getb(blocked, x, y, z)) continue;
-            int x0 = x;
-            while (x0 > 0 && !getb(blocked, x0 - 1, y, z) && !getb(exterior, x0 - 1, y, z)) --x0;
-            int x1 = x;
-            while (x1 + 1 < res && !getb(blocked, x1 + 1, y, z) && !getb(exterior, x1 + 1, y, z)) ++x1;
-            for (int xi = x0; xi <= x1; ++xi) setb(exterior, xi, y, z);
-            for (int xi = x0; xi <= x1; ++xi) {
+            const int z = st.back(); st.pop_back();
+            const int y = st.back(); st.pop_back();
+            const int x = st.back(); st.pop_back();
+            if (!allow(x, y, z)) continue;
+            int z0 = z;
+            while (z0 > 0 && allow(x, y, z0 - 1)) --z0;
+            int z1 = z;
+            while (z1 + 1 < res && allow(x, y, z1 + 1)) ++z1;
+            for (int zi = z0; zi <= z1; ++zi) setb(exterior, x, y, zi);
+            for (int zi = z0; zi <= z1; ++zi) {
                 auto step = [&](int nx, int ny, int nz, bool prev_open) {
                     if (prev_open) return;
-                    push_empty(nx, ny, nz);
+                    if (cell_oob(nx, ny, nz)) return;
+                    if (!getb(blocked, nx, ny, nz)) {
+                        const int nci = coarse_index(nx, ny, nz);
+                        if (ckind[(size_t)nci] == 0) cpush(nx / kCoarse, ny / kCoarse, nz / kCoarse);
+                    }
+                    push(nx, ny, nz);
                 };
-                const bool prev_ym = xi > x0 && y > 0 && !getb(blocked, xi - 1, y - 1, z) && !getb(exterior, xi - 1, y - 1, z);
-                const bool prev_yp = xi > x0 && y + 1 < res && !getb(blocked, xi - 1, y + 1, z) && !getb(exterior, xi - 1, y + 1, z);
-                const bool prev_zm = xi > x0 && z > 0 && !getb(blocked, xi - 1, y, z - 1) && !getb(exterior, xi - 1, y, z - 1);
-                const bool prev_zp = xi > x0 && z + 1 < res && !getb(blocked, xi - 1, y, z + 1) && !getb(exterior, xi - 1, y, z + 1);
-                step(xi, y - 1, z, prev_ym);
-                step(xi, y + 1, z, prev_yp);
-                step(xi, y, z - 1, prev_zm);
-                step(xi, y, z + 1, prev_zp);
+                const bool prev_xm = zi > z0 && x > 0 && allow(x - 1, y, zi - 1);
+                const bool prev_xp = zi > z0 && x + 1 < res && allow(x + 1, y, zi - 1);
+                const bool prev_ym = zi > z0 && y > 0 && allow(x, y - 1, zi - 1);
+                const bool prev_yp = zi > z0 && y + 1 < res && allow(x, y + 1, zi - 1);
+                step(x - 1, y, zi, prev_xm);
+                step(x + 1, y, zi, prev_xp);
+                step(x, y - 1, zi, prev_ym);
+                step(x, y + 1, zi, prev_yp);
             }
         }
+        // Empty blocks touched by the fine flood (a recess entered through a
+        // neck thinner than one coarse block) join the exterior.
+        c_drain();
+        flood_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
 
     void build(const float* verts, int nV, const int32_t* faces, int64_t nF, int resolution, float sc) {
         res = resolution;
         scale = sc;
         ready = false;
+        seal_s = 0;
+        flood_s = 0;
         if (res <= 1 || nF <= 0 || nV <= 0) return;
+        amin[0] = amin[1] = amin[2] = res;
+        amax[0] = amax[1] = amax[2] = -1;
+        for (int i = 0; i < nV; ++i) {
+            float g[3];
+            to_grid(verts + 3 * i, g);
+            for (int k = 0; k < 3; ++k) {
+                int c = (int)std::floor(g[k]);
+                if (c < 0) c = 0;
+                if (c >= res) c = res - 1;
+                amin[k] = std::min(amin[k], c);
+                amax[k] = std::max(amax[k], c);
+            }
+        }
         const size_t words = (size_t)((ncells() + 63) / 64);
         blocked.assign(words, 0);
         exterior.assign(words, 0);
+        blocked_ids.clear();
         voxelize(verts, faces, nF, nV);
-        bool any_blocked = false;
-        for (uint64_t w : blocked) if (w) { any_blocked = true; break; }
-        if (!any_blocked) {
+        if (blocked_ids.empty()) {
             blocked.clear();
             exterior.clear();
             return;
@@ -306,134 +485,168 @@ struct ExteriorGrid {
     }
 };
 
-bool ray_hits_tri(const float o[3], const float d[3], const float* a, const float* b, const float* c) {
-    const float e1[3] = {b[0]-a[0], b[1]-a[1], b[2]-a[2]};
-    const float e2[3] = {c[0]-a[0], c[1]-a[1], c[2]-a[2]};
-    const float p[3] = {d[1]*e2[2]-d[2]*e2[1], d[2]*e2[0]-d[0]*e2[2], d[0]*e2[1]-d[1]*e2[0]};
-    const float det = e1[0]*p[0] + e1[1]*p[1] + e1[2]*p[2];
-    if (std::fabs(det) < 1e-12f) return false;
-    const float inv = 1.f / det;
-    const float tvec[3] = {o[0]-a[0], o[1]-a[1], o[2]-a[2]};
-    const float u = (tvec[0]*p[0] + tvec[1]*p[1] + tvec[2]*p[2]) * inv;
-    if (u < 0.f || u > 1.f) return false;
-    const float qv[3] = {tvec[1]*e1[2]-tvec[2]*e1[1], tvec[2]*e1[0]-tvec[0]*e1[2], tvec[0]*e1[1]-tvec[1]*e1[0]};
-    const float v = (d[0]*qv[0] + d[1]*qv[1] + d[2]*qv[2]) * inv;
-    if (v < 0.f || u + v > 1.f) return false;
-    const float t = (e2[0]*qv[0] + e2[1]*qv[1] + e2[2]*qv[2]) * inv;
-    return t > 1e-5f;
-}
-
-// Odd parity along +X means the point is inside a closed shell. Used only to
-// drop a small component trapped inside a larger one (an inner-wall fragment).
-bool point_inside_component(const Mesh& m, const std::vector<int>& fcomp, int comp, const float o[3]) {
-    const float dirs[3][3] = {{1.f, 0.017f, 0.011f}, {0.013f, 1.f, 0.019f}, {0.011f, 0.013f, 1.f}};
-    int insides = 0;
-    for (const auto& d : dirs) {
-        int hits = 0;
-        for (int f = 0; f < m.F(); ++f) {
-            if (comp >= 0 && fcomp[f] != comp) continue;
-            const float* a = &m.verts[3 * m.faces[3*f]];
-            const float* b = &m.verts[3 * m.faces[3*f+1]];
-            const float* c = &m.verts[3 * m.faces[3*f+2]];
-            if (ray_hits_tri(o, d, a, b, c)) ++hits;
-        }
-        insides += hits & 1;
-    }
-    return insides >= 2;
-}
-
-struct FaceAgg {
-    int faces = 0;
-    int boundary = 0;
-    double vol = 0;
-    double ext = 0, inn = 0;
-    double cx = 0, cy = 0, cz = 0;
-    float bmin[3] = {1e30f, 1e30f, 1e30f};
-    float bmax[3] = {-1e30f, -1e30f, -1e30f};
-};
-
 int find_root(std::vector<int>& par, int x) {
     while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; }
     return x;
 }
 
-// Per vertex-connected component: drop a small piece whose centroids sit in
-// the interior (an inner-wall fragment). A large piece in the interior means
-// the sign field inverted — caller rebuilds the unsigned band for that bbox.
-// Nearly-closed pieces with negative volume are flipped outward.
-// Returns false when a large component failed and `failed_boxes` lists the
-// boxes that must be replaced from the unsigned shell. `m` is updated.
-bool screen_shell(Mesh& m, const ExteriorGrid& grid, std::vector<float>& failed_boxes) {
-    failed_boxes.clear();
-    const int V = m.V();
-    const int F = m.F();
-    if (V <= 0 || F <= 0) return false;
+void unite(std::vector<int>& par, int a, int b) {
+    a = find_root(par, a);
+    b = find_root(par, b);
+    if (a != b) par[a] = b;
+}
+
+uint64_t edge_key(int a, int b) {
+    if (a > b) std::swap(a, b);
+    return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b;
+}
+
+// Dual-contour one active set. `vmap` / `fvert` cover every corner of `acoord`
+// (the unsigned cell set is a superset of the signed one, so one vertex field
+// serves both shells).
+Mesh contour_mesh(const std::vector<int>& acoord,
+                  const std::unordered_map<uint64_t, int>& vmap,
+                  const std::vector<float>& fvert,
+                  int res, float scale) {
+    const int64_t Na = (int64_t)acoord.size() / 3;
+    Mesh built;
+    if (Na <= 0) return built;
+    std::unordered_map<uint64_t, int> vox;
+    vox.reserve((size_t)Na * 2);
+    for (int64_t i = 0; i < Na; ++i)
+        vox.emplace(key3(acoord[3 * i], acoord[3 * i + 1], acoord[3 * i + 2]), (int)i);
+    auto fval = [&](int x, int y, int z) -> float {
+        auto it = vmap.find(key3(x, y, z));
+        return it == vmap.end() ? 1e9f : fvert[(size_t)it->second];
+    };
+    std::vector<float> dual((size_t)Na * 3);
+    std::vector<int8_t> owned((size_t)Na * 3, 0);
+    parallel_for(Na, [&](int64_t b, int64_t e) {
+        for (int64_t i = b; i < e; ++i) {
+            const int vx = acoord[3 * i], vy = acoord[3 * i + 1], vz = acoord[3 * i + 2];
+            double sum[3] = {0, 0, 0};
+            int cnt = 0;
+            for (int axis = 0; axis < 3; ++axis)
+                for (int u = 0; u < 2; ++u) for (int v = 0; v < 2; ++v) {
+                    int a0[3] = {vx, vy, vz}, a1[3];
+                    a0[(axis + 1) % 3] += u;
+                    a0[(axis + 2) % 3] += v;
+                    a1[0] = a0[0]; a1[1] = a0[1]; a1[2] = a0[2];
+                    a1[axis] += 1;
+                    const float v1 = fval(a0[0], a0[1], a0[2]);
+                    const float v2 = fval(a1[0], a1[1], a1[2]);
+                    const bool c12 = v1 < 0 && v2 >= 0, c21 = v1 >= 0 && v2 < 0;
+                    if (c12 || c21) {
+                        const float t = -v1 / (v2 - v1);
+                        double pt[3] = {(double)a0[0], (double)a0[1], (double)a0[2]};
+                        pt[axis] += t;
+                        for (int k = 0; k < 3; ++k) sum[k] += pt[k];
+                        ++cnt;
+                    }
+                    if (u == 1 && v == 1) owned[3 * i + axis] = c12 ? 1 : (c21 ? -1 : 0);
+                }
+            if (cnt) for (int k = 0; k < 3; ++k) dual[3 * i + k] = (float)(sum[k] / cnt);
+            else { dual[3 * i] = vx + 0.5f; dual[3 * i + 1] = vy + 0.5f; dual[3 * i + 2] = vz + 0.5f; }
+        }
+    });
+    static const int OFF[3][4][3] = {
+        {{0,0,0}, {0,0,1}, {0,1,1}, {0,1,0}},
+        {{0,0,0}, {1,0,0}, {1,0,1}, {0,0,1}},
+        {{0,0,0}, {0,1,0}, {1,1,0}, {1,0,0}},
+    };
+    std::vector<int32_t> qfaces;
+    qfaces.reserve((size_t)Na * 6);
+    std::vector<uint8_t> used((size_t)Na, 0);
+    for (int64_t i = 0; i < Na; ++i) {
+        const int vx = acoord[3 * i], vy = acoord[3 * i + 1], vz = acoord[3 * i + 2];
+        for (int axis = 0; axis < 3; ++axis) {
+            const int dir = owned[3 * i + axis];
+            if (!dir) continue;
+            int q[4];
+            bool ok = true;
+            for (int k = 0; k < 4 && ok; ++k) {
+                auto it = vox.find(key3(vx + OFF[axis][k][0], vy + OFF[axis][k][1], vz + OFF[axis][k][2]));
+                if (it == vox.end()) ok = false;
+                else q[k] = it->second;
+            }
+            if (!ok) continue;
+            static const int S1N[6] = {0, 1, 2, 0, 2, 3};
+            static const int S1P[6] = {0, 2, 1, 0, 3, 2};
+            const int* sp = dir > 0 ? S1P : S1N;
+            for (int k = 0; k < 6; ++k) qfaces.push_back(q[sp[k]]);
+            for (int k = 0; k < 4; ++k) used[q[k]] = 1;
+        }
+    }
+    std::vector<int32_t> remap((size_t)Na, -1);
+    for (int64_t i = 0; i < Na; ++i)
+        if (used[i]) {
+            remap[i] = built.V();
+            built.verts.push_back((dual[3 * i]     / res - 0.5f) * scale);
+            built.verts.push_back((dual[3 * i + 1] / res - 0.5f) * scale);
+            built.verts.push_back((dual[3 * i + 2] / res - 0.5f) * scale);
+        }
+    built.faces.resize(qfaces.size());
+    for (size_t k = 0; k < qfaces.size(); ++k) built.faces[k] = remap[qfaces[k]];
+    return built;
+}
+
+// Vertex-connected components. face_comp[f] and vert_comp[v] are dense ids, or -1.
+int component_ids(const Mesh& m, std::vector<int>& face_comp, std::vector<int>& vert_comp) {
+    const int V = m.V(), F = m.F();
+    face_comp.assign((size_t)std::max(F, 0), -1);
+    vert_comp.assign((size_t)std::max(V, 0), -1);
+    if (V <= 0 || F <= 0) return 0;
     std::vector<int> par((size_t)V);
     for (int i = 0; i < V; ++i) par[i] = i;
-    auto uni = [&](int a, int b) {
-        a = find_root(par, a); b = find_root(par, b);
-        if (a != b) par[a] = b;
-    };
     for (int f = 0; f < F; ++f) {
-        const int a = m.faces[3*f], b = m.faces[3*f+1], c = m.faces[3*f+2];
+        const int a = m.faces[3 * f], b = m.faces[3 * f + 1], c = m.faces[3 * f + 2];
         if (a < 0 || b < 0 || c < 0 || a >= V || b >= V || c >= V) continue;
-        uni(a, b); uni(b, c);
+        unite(par, a, b);
+        unite(par, b, c);
     }
     std::unordered_map<int, int> cid;
-    std::vector<int> fcomp((size_t)F, -1);
+    cid.reserve(64);
     for (int f = 0; f < F; ++f) {
-        const int a = m.faces[3*f];
+        const int a = m.faces[3 * f], b = m.faces[3 * f + 1], c = m.faces[3 * f + 2];
         if (a < 0 || a >= V) continue;
         const int r = find_root(par, a);
         auto it = cid.find(r);
         if (it == cid.end()) it = cid.emplace(r, (int)cid.size()).first;
-        fcomp[f] = it->second;
+        face_comp[f] = it->second;
+        vert_comp[a] = it->second;
+        if (b >= 0 && b < V) vert_comp[b] = it->second;
+        if (c >= 0 && c < V) vert_comp[c] = it->second;
     }
-    const int nc = (int)cid.size();
-    if (nc <= 0) return false;
-    std::vector<FaceAgg> ag((size_t)nc);
-    for (int f = 0; f < F; ++f) {
-        const int c = fcomp[f];
-        if (c < 0) continue;
-        const int ia = m.faces[3*f], ib = m.faces[3*f+1], ic = m.faces[3*f+2];
-        const float* pa = &m.verts[3*ia];
-        const float* pb = &m.verts[3*ib];
-        const float* pc = &m.verts[3*ic];
-        float e1[3], e2[3];
-        for (int k = 0; k < 3; ++k) { e1[k] = pb[k]-pa[k]; e2[k] = pc[k]-pa[k]; }
-        const float nx = e1[1]*e2[2] - e1[2]*e2[1];
-        const float ny = e1[2]*e2[0] - e1[0]*e2[2];
-        const float nz = e1[0]*e2[1] - e1[1]*e2[0];
-        const double area = 0.5 * std::sqrt((double)nx*nx + (double)ny*ny + (double)nz*nz);
-        FaceAgg& A = ag[c];
-        A.faces++;
-        A.vol += (double)pa[0]*nx + (double)pa[1]*ny + (double)pa[2]*nz;
-        const float cx = (pa[0]+pb[0]+pc[0]) / 3.f;
-        const float cy = (pa[1]+pb[1]+pc[1]) / 3.f;
-        const float cz = (pa[2]+pb[2]+pc[2]) / 3.f;
-        const float q[3] = {cx, cy, cz};
-        if (grid.is_outside(q)) A.ext += area; else A.inn += area;
-        A.cx += cx * area; A.cy += cy * area; A.cz += cz * area;
-        for (int k = 0; k < 3; ++k) {
-            const float* p[3] = {pa, pb, pc};
-            for (int j = 0; j < 3; ++j) {
-                A.bmin[k] = std::min(A.bmin[k], p[j][k]);
-                A.bmax[k] = std::max(A.bmax[k], p[j][k]);
-            }
-        }
-    }
+    return (int)cid.size();
+}
+
+int real_piece_count(const Mesh& m) {
+    std::vector<int> face_comp, vert_comp;
+    const int nc = component_ids(m, face_comp, vert_comp);
+    if (nc <= 0) return 0;
+    std::vector<int> cnt((size_t)nc, 0);
+    for (int c : face_comp) if (c >= 0) cnt[c]++;
+    int largest = 0;
+    for (int c : cnt) largest = std::max(largest, c);
+    int real = 0;
+    for (int c : cnt) if (largest > 0 && (int64_t)c * 50 >= largest) ++real;
+    return real;
+}
+
+void count_boundary_per_comp(const Mesh& m, const std::vector<int>& face_comp, int nc, std::vector<int>& boundary) {
+    boundary.assign((size_t)std::max(nc, 0), 0);
+    if (nc <= 0 || m.F() <= 0) return;
     struct EK { uint64_t k; int c; };
     std::vector<EK> edges;
-    edges.reserve((size_t)F * 3);
-    auto ek = [](int a, int b) -> uint64_t {
-        if (a > b) std::swap(a, b);
-        return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b;
-    };
-    for (int f = 0; f < F; ++f) {
-        if (fcomp[f] < 0) continue;
+    edges.reserve((size_t)m.F() * 3);
+    const int V = m.V();
+    for (int f = 0; f < m.F(); ++f) {
+        const int c = f < (int)face_comp.size() ? face_comp[f] : -1;
+        if (c < 0 || c >= nc) continue;
         for (int j = 0; j < 3; ++j) {
-            const int a = m.faces[3*f+j], b = m.faces[3*f+(j+1)%3];
-            edges.push_back({ek(a, b), fcomp[f]});
+            const int a = m.faces[3 * f + j], b = m.faces[3 * f + (j + 1) % 3];
+            if (a < 0 || b < 0 || a >= V || b >= V) continue;
+            edges.push_back({edge_key(a, b), c});
         }
     }
     std::sort(edges.begin(), edges.end(), [](const EK& p, const EK& q) {
@@ -443,74 +656,270 @@ bool screen_shell(Mesh& m, const ExteriorGrid& grid, std::vector<float>& failed_
     for (size_t i = 0; i < edges.size();) {
         size_t j = i + 1;
         while (j < edges.size() && edges[j].k == edges[i].k && edges[j].c == edges[i].c) ++j;
-        if (j - i == 1) ag[edges[i].c].boundary++;
+        if (j - i == 1) boundary[edges[i].c]++;
         i = j;
     }
-    int largest = 0;
-    for (const FaceAgg& A : ag) largest = std::max(largest, A.faces);
-    std::vector<char> drop((size_t)nc, 0), flip((size_t)nc, 0);
-    bool need_unsigned = false;
-    const float pad = grid.ready ? 4.f * grid.scale / (float)grid.res : 0.05f;
-    int main_c = 0;
-    for (int c = 1; c < nc; ++c) if (ag[c].faces > ag[main_c].faces) main_c = c;
-    for (int c = 0; c < nc; ++c) {
-        const FaceAgg& A = ag[c];
-        const double tot = A.ext + A.inn;
-        const double ext_frac = tot > 0 ? A.ext / tot : 1.0;
-        const bool big = largest > 0 && A.faces * 5 >= largest;
-        if (c != main_c && tot > 0) {
-            const float q[3] = {(float)(A.cx / tot), (float)(A.cy / tot), (float)(A.cz / tot)};
-            // A fragment whose centroid is inside the main shell is the inner wall.
-            if (point_inside_component(m, fcomp, main_c, q)) { drop[c] = 1; continue; }
+}
+
+// Grid hash of mesh vertices. Lookups stay inside a few cells of the query,
+// which is the 1.5·eps acceptance neighbourhood — not a full BVH pass.
+struct NearGrid {
+    int res = 0;
+    float scale = 1.f;
+    int rad = 2;
+    std::vector<uint64_t> bits;
+    std::unordered_map<uint64_t, std::vector<int>> cells;
+
+    void reset(int resolution, float sc, int radius) {
+        res = std::max(resolution, 1);
+        scale = sc;
+        rad = std::max(radius, 1);
+        const int64_t nbits = (int64_t)res * res * res;
+        bits.assign((size_t)((nbits + 63) / 64), 0);
+        cells.clear();
+    }
+    void cell_of(const float p[3], int c[3]) const {
+        for (int k = 0; k < 3; ++k) {
+            const float g = (p[k] / scale + 0.5f) * (float)res;
+            int i = (int)std::floor(g);
+            if (i < 0) i = 0;
+            if (i >= res) i = res - 1;
+            c[k] = i;
         }
-        if (ext_frac < 0.45) {
-            if (big) {
-                need_unsigned = true;
-                if (A.bmin[0] <= A.bmax[0]) {
-                    failed_boxes.push_back(A.bmin[0] - pad);
-                    failed_boxes.push_back(A.bmin[1] - pad);
-                    failed_boxes.push_back(A.bmin[2] - pad);
-                    failed_boxes.push_back(A.bmax[0] + pad);
-                    failed_boxes.push_back(A.bmax[1] + pad);
-                    failed_boxes.push_back(A.bmax[2] + pad);
-                }
-                drop[c] = 1;
-            } else {
-                drop[c] = 1; // stray inner-wall fragment
-            }
+    }
+    void add(const float p[3], int idx) {
+        int c[3];
+        cell_of(p, c);
+        const int64_t i = ((int64_t)c[0] * res + c[1]) * res + c[2];
+        bits[(size_t)(i >> 6)] |= 1ull << (unsigned)(i & 63);
+        cells[key3(c[0], c[1], c[2])].push_back(idx);
+    }
+    bool occupied(int x, int y, int z) const {
+        if ((unsigned)x >= (unsigned)res || (unsigned)y >= (unsigned)res || (unsigned)z >= (unsigned)res) return false;
+        const int64_t i = ((int64_t)x * res + y) * res + z;
+        return ((bits[(size_t)(i >> 6)] >> (unsigned)(i & 63)) & 1ull) != 0;
+    }
+    int nearest(const float p[3], const std::vector<float>& verts, float& dist, float stop) const {
+        int c[3];
+        cell_of(p, c);
+        float best2 = 1e30f;
+        int best = -1;
+        const float stop2 = stop * stop;
+        for (int r = 0; r <= rad && best2 > stop2; ++r) {
+            for (int dz = -r; dz <= r; ++dz)
+                for (int dy = -r; dy <= r; ++dy)
+                    for (int dx = -r; dx <= r; ++dx) {
+                        const int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy, adz = dz < 0 ? -dz : dz;
+                        if (r > 0 && std::max(adx, std::max(ady, adz)) != r) continue;
+                        const int x = c[0] + dx, y = c[1] + dy, z = c[2] + dz;
+                        if (!occupied(x, y, z)) continue;
+                        auto it = cells.find(key3(x, y, z));
+                        if (it == cells.end()) continue;
+                        for (int vi : it->second) {
+                            const float* q = &verts[(size_t)3 * vi];
+                            const float d0 = q[0] - p[0], d1 = q[1] - p[1], d2 = q[2] - p[2];
+                            const float d2s = d0 * d0 + d1 * d1 + d2 * d2;
+                            if (d2s < best2) { best2 = d2s; best = vi; }
+                        }
+                    }
+        }
+        dist = best < 0 ? 1e30f : std::sqrt(best2);
+        return best;
+    }
+};
+
+void append_faces(Mesh& dst, const Mesh& src, const std::vector<int>& face_ids) {
+    std::unordered_map<int, int> remap;
+    remap.reserve(face_ids.size() * 2 + 8);
+    for (int f : face_ids) {
+        if (f < 0 || f >= src.F()) continue;
+        for (int k = 0; k < 3; ++k) {
+            const int v = src.faces[3 * f + k];
+            if (v < 0 || v >= src.V()) { dst.faces.push_back(0); continue; }
+            int nv;
+            auto it = remap.find(v);
+            if (it == remap.end()) {
+                nv = dst.V();
+                remap.emplace(v, nv);
+                dst.verts.insert(dst.verts.end(), &src.verts[(size_t)3 * v], &src.verts[(size_t)3 * v] + 3);
+            } else nv = it->second;
+            dst.faces.push_back(nv);
+        }
+    }
+}
+
+enum ShellFail { kKeep = 0, kCoverage = 1, kOpen = 2, kPieces = 3, kDropInterior = 4 };
+
+// Signed shell S replaces the unsigned double shell U only where S still covers
+// every outer vertex of U (within 1.5·eps), adds no open edges, and keeps that
+// component as one real piece. Anything else keeps U's double shell for that
+// component. A component with no outer vertex is the inner wall and is dropped.
+Mesh choose_shell(Mesh U, Mesh S, const ExteriorGrid& grid, float eps, int band,
+                  int& faces_before, int& removed, const char*& note) {
+    faces_before = U.F();
+    removed = 0;
+    note = " (unsigned fallback)";
+    if (U.F() <= 0) return U;
+    if (S.F() <= 0 || !grid.ready) {
+        printf("  remesh postproc: outer shell fallback component faces=%d reason=empty-signed\n", U.F());
+        fflush(stdout);
+        return U;
+    }
+    std::vector<int> u_face, u_vert;
+    const int nu = component_ids(U, u_face, u_vert);
+    if (nu <= 0) return U;
+    std::vector<int> u_boundary, u_faces((size_t)nu, 0);
+    count_boundary_per_comp(U, u_face, nu, u_boundary);
+    for (int f = 0; f < U.F(); ++f) if (u_face[f] >= 0) u_faces[u_face[f]]++;
+
+    std::vector<char> outer((size_t)U.V(), 0);
+    for (int i = 0; i < U.V(); ++i) {
+        if (u_vert[i] < 0) continue;
+        const float p[3] = {U.verts[3 * i], U.verts[3 * i + 1], U.verts[3 * i + 2]};
+        if (grid.is_outside(p)) outer[i] = 1;
+    }
+
+    const int rad = (int)std::ceil(1.5f * (float)std::max(band, 1)) + 1;
+    const float gap_lim = 1.5f * eps;
+    NearGrid occ;
+    occ.reset(grid.res, grid.scale, rad);
+    for (int i = 0; i < S.V(); ++i) occ.add(&S.verts[3 * i], i);
+
+    std::vector<int> why((size_t)nu, kKeep);
+    std::vector<int> misses((size_t)nu, 0), checked((size_t)nu, 0);
+    std::vector<float> max_gap((size_t)nu, 0.f);
+    for (int i = 0; i < U.V(); ++i) {
+        if (!outer[i]) continue;
+        const int c = u_vert[i];
+        if (c < 0 || c >= nu) continue;
+        ++checked[c];
+        float d = 0.f;
+        occ.nearest(&U.verts[3 * i], S.verts, d, gap_lim);
+        max_gap[c] = std::max(max_gap[c], d);
+        if (d > gap_lim) ++misses[c];
+    }
+    occ.bits.clear();
+    occ.cells.clear();
+    for (int c = 0; c < nu; ++c) {
+        if (checked[c] == 0) why[c] = kDropInterior;
+        else if (misses[c] > 0) why[c] = kCoverage;
+    }
+
+    NearGrid outer_occ;
+    outer_occ.reset(grid.res, grid.scale, rad);
+    for (int i = 0; i < U.V(); ++i)
+        if (outer[i]) outer_occ.add(&U.verts[3 * i], i);
+    std::vector<int> s_asg((size_t)S.F(), -1);
+    for (int f = 0; f < S.F(); ++f) {
+        const int ia = S.faces[3 * f], ib = S.faces[3 * f + 1], ic = S.faces[3 * f + 2];
+        if (ia < 0 || ib < 0 || ic < 0 || ia >= S.V() || ib >= S.V() || ic >= S.V()) continue;
+        const float q[3] = {
+            (S.verts[3 * ia] + S.verts[3 * ib] + S.verts[3 * ic]) / 3.f,
+            (S.verts[3 * ia + 1] + S.verts[3 * ib + 1] + S.verts[3 * ic + 1]) / 3.f,
+            (S.verts[3 * ia + 2] + S.verts[3 * ib + 2] + S.verts[3 * ic + 2]) / 3.f,
+        };
+        float d = 0.f;
+        const int vi = outer_occ.nearest(q, U.verts, d, gap_lim);
+        if (vi >= 0 && d <= gap_lim && u_vert[vi] >= 0) s_asg[f] = u_vert[vi];
+    }
+
+    std::vector<int> s_boundary;
+    count_boundary_per_comp(S, s_asg, nu, s_boundary);
+
+    std::vector<int> par((size_t)std::max(S.V(), 0));
+    for (int i = 0; i < S.V(); ++i) par[i] = i;
+    for (int f = 0; f < S.F(); ++f) {
+        if (s_asg[f] < 0) continue;
+        const int a = S.faces[3 * f], b = S.faces[3 * f + 1], c = S.faces[3 * f + 2];
+        if (a < 0 || b < 0 || c < 0 || a >= S.V() || b >= S.V() || c >= S.V()) continue;
+        unite(par, a, b);
+        unite(par, b, c);
+    }
+    std::vector<int> pieces((size_t)nu, 0);
+    for (int c = 0; c < nu; ++c) {
+        if (why[c] == kDropInterior) continue;
+        if (why[c] == kKeep && s_boundary[c] > u_boundary[c]) why[c] = kOpen;
+        std::unordered_map<int, int> roots;
+        int assigned = 0;
+        for (int f = 0; f < S.F(); ++f) {
+            if (s_asg[f] != c) continue;
+            ++assigned;
+            const int a = S.faces[3 * f];
+            if (a < 0 || a >= S.V()) continue;
+            roots[find_root(par, a)]++;
+        }
+        int significant = 0;
+        const int thresh = std::max(1, assigned / 50);
+        for (const auto& kv : roots) if (kv.second >= thresh) ++significant;
+        pieces[c] = significant;
+        if (why[c] == kKeep && significant != 1) why[c] = kPieces;
+    }
+
+    bool any_keep = false, any_fallback = false;
+    int expect_largest = 0;
+    for (int c = 0; c < nu; ++c) {
+        if (why[c] == kDropInterior) {
+            printf("  remesh postproc: outer shell dropped interior component faces=%d\n", u_faces[c]);
             continue;
         }
-        const bool closed = (int64_t)A.boundary * 100 <= (int64_t)std::max(A.faces, 1);
-        if (closed && A.vol < 0.0) flip[c] = 1;
-    }
-    bool any_drop = false, any_flip = false;
-    for (int c = 0; c < nc; ++c) { any_drop = any_drop || drop[c]; any_flip = any_flip || flip[c]; }
-    if (any_flip) {
-        for (int f = 0; f < F; ++f)
-            if (fcomp[f] >= 0 && flip[fcomp[f]]) std::swap(m.faces[3*f+1], m.faces[3*f+2]);
-    }
-    if (any_drop) {
-        std::vector<int32_t> nf;
-        nf.reserve(m.faces.size());
-        for (int f = 0; f < F; ++f)
-            if (fcomp[f] < 0 || !drop[fcomp[f]])
-                for (int k = 0; k < 3; ++k) nf.push_back(m.faces[3*f+k]);
-        m.faces.swap(nf);
-        std::vector<int> remap((size_t)V, -1);
-        std::vector<float> nv;
-        nv.reserve(m.verts.size());
-        for (size_t i = 0; i < m.faces.size(); ++i) {
-            int v = m.faces[i];
-            if (v < 0 || v >= V) continue;
-            if (remap[v] < 0) {
-                remap[v] = (int)(nv.size() / 3);
-                nv.insert(nv.end(), &m.verts[3*v], &m.verts[3*v] + 3);
-            }
-            m.faces[i] = remap[v];
+        if (why[c] == kKeep) { any_keep = true; expect_largest = std::max(expect_largest, u_faces[c]); continue; }
+        any_fallback = true;
+        expect_largest = std::max(expect_largest, u_faces[c]);
+        if (why[c] == kCoverage) {
+            printf("  remesh postproc: outer shell fallback component faces=%d reason=coverage misses=%d/%d max_gap=%.4g eps=%.4g\n",
+                   u_faces[c], misses[c], checked[c], max_gap[c], eps);
+        } else if (why[c] == kOpen) {
+            printf("  remesh postproc: outer shell fallback component faces=%d reason=open-edges %d (unsigned %d)\n",
+                   u_faces[c], s_boundary[c], u_boundary[c]);
+        } else {
+            printf("  remesh postproc: outer shell fallback component faces=%d reason=pieces signed=%d\n",
+                   u_faces[c], pieces[c]);
         }
-        m.verts.swap(nv);
     }
-    return !need_unsigned;
+    fflush(stdout);
+
+    auto expect_real = [&]() {
+        int n = 0;
+        for (int c = 0; c < nu; ++c) {
+            if (why[c] == kDropInterior) continue;
+            if (expect_largest > 0 && (int64_t)u_faces[c] * 50 >= expect_largest) ++n;
+        }
+        return n;
+    };
+
+    if (!any_keep) {
+        note = " (unsigned fallback)";
+        removed = 0;
+        return U;
+    }
+
+    Mesh mixed;
+    for (int c = 0; c < nu; ++c) {
+        if (why[c] == kDropInterior) continue;
+        std::vector<int> ids;
+        if (why[c] != kKeep) {
+            ids.reserve((size_t)u_faces[c]);
+            for (int f = 0; f < U.F(); ++f) if (u_face[f] == c) ids.push_back(f);
+            append_faces(mixed, U, ids);
+        } else {
+            for (int f = 0; f < S.F(); ++f) if (s_asg[f] == c) ids.push_back(f);
+            append_faces(mixed, S, ids);
+        }
+    }
+    const int got = real_piece_count(mixed);
+    const int want = expect_real();
+    if (got < want) {
+        printf("  remesh postproc: outer shell fallback component faces=%d reason=pieces signed=%d unsigned=%d\n",
+               U.F(), got, want);
+        fflush(stdout);
+        note = " (unsigned fallback)";
+        removed = 0;
+        return U;
+    }
+    note = any_fallback ? " (partial fallback)" : "";
+    removed = U.F() - mixed.F();
+    if (removed < 0) removed = 0;
+    return mixed;
 }
 
 }  // namespace
@@ -580,8 +989,7 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                 for (size_t i = 0; i < cand.size(); ++i) cand[i] |= bits[i];
     }
 
-    // Candidate indices, then drop the res³ bitset before the shell orientation
-    // tables (those are the new peak, and they must not sit on top of the bitset).
+    // Candidate indices, then drop the res³ bitset before the shell tables.
     std::vector<int64_t> cand_cells;
     for (int64_t w = 0; w < (int64_t)cand.size(); ++w) {
         uint64_t bits = cand[w];
@@ -591,237 +999,96 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
             cand_cells.push_back((w << 6) | b);
         }
     }
+
     cand.clear(); cand.shrink_to_fit();
 
     const auto t_shell = std::chrono::steady_clock::now();
     ExteriorGrid grid;
     grid.build(iverts, (int)iV, ifaces, (int)iF, res, scale);
-    const double flood_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_shell).count();
 
-    // Active voxels. |UDF−eps| < 0.87·cell is the unsigned tube (both walls).
-    // The outer wall is the same band restricted to cells the flood reached.
-    int64_t n_udf = 0, n_sdf = 0;
-    int64_t active_voxels = 0;
-    bool built_ok = false;
-    for (int pass = 0; pass < 2 && !built_ok; ++pass) {
-        const bool use_signed = grid.ready && pass == 0;
-        std::vector<int> acoord;
-        {
-            std::vector<uint8_t> act_u(cand_cells.size(), 0), act_s(cand_cells.size(), 0);
-            parallel_for((int64_t)cand_cells.size(), [&](int64_t b, int64_t e) {
-                for (int64_t i = b; i < e; ++i) {
-                    const int64_t c = cand_cells[i];
-                    const int x = (int)(c / ((int64_t)res * res)), y = (int)((c / res) % res), z = (int)(c % res);
-                    const float p[3] = { ((x + 0.5f) / res - 0.5f) * scale,
-                                         ((y + 0.5f) / res - 0.5f) * scale,
-                                         ((z + 0.5f) / res - 0.5f) * scale };
-                    const TriBvh::Hit h = bvh.closest(p, eps + keep);
-                    if (h.face < 0) continue;
-                    const float udf = std::sqrt(h.dist2);
-                    if (std::fabs(udf - eps) < keep) act_u[i] = 1;
-                    if (use_signed && grid.is_outside(p) && std::fabs(udf - eps) < keep) act_s[i] = 1;
-                }
-            });
-            if (pass == 0) {
-                n_udf = 0; n_sdf = 0;
-                for (size_t i = 0; i < cand_cells.size(); ++i) {
-                    if (act_u[i]) ++n_udf;
-                    if (act_s[i]) ++n_sdf;
-                }
-            }
-            for (size_t i = 0; i < cand_cells.size(); ++i) {
-                if (use_signed ? !act_s[i] : !act_u[i]) continue;
-                const int64_t c = cand_cells[i];
-                acoord.push_back((int)(c / ((int64_t)res * res)));
-                acoord.push_back((int)((c / res) % res));
-                acoord.push_back((int)(c % res));
-            }
+    // One closest-point pass classifies the unsigned tube and the outer sheet.
+    // Both shells are contoured from that field. Faces are never deleted: the
+    // signed shell replaces the double shell only where it still covers it.
+    std::vector<uint8_t> act_u(cand_cells.size(), 0);
+    parallel_for((int64_t)cand_cells.size(), [&](int64_t b, int64_t e) {
+        for (int64_t i = b; i < e; ++i) {
+            const int64_t c = cand_cells[i];
+            const int x = (int)(c / ((int64_t)res * res)), y = (int)((c / res) % res), z = (int)(c % res);
+            const float p[3] = { ((x + 0.5f) / res - 0.5f) * scale,
+                                 ((y + 0.5f) / res - 0.5f) * scale,
+                                 ((z + 0.5f) / res - 0.5f) * scale };
+            const TriBvh::Hit h = bvh.closest(p, eps + keep);
+            if (h.face < 0) continue;
+            const float udf = std::sqrt(h.dist2);
+            if (std::fabs(udf - eps) < keep) act_u[i] = 1;
         }
-        const int64_t Na = (int64_t)acoord.size() / 3;
-        if (Na < 100) {
-            if (use_signed && n_udf >= 100) continue;
-            fprintf(stderr, "  remesh: only %lld active voxels; skipping remesh\n", (long long)Na);
-            return out;
-        }
-
-        std::unordered_map<uint64_t, int> vox;
-        vox.reserve((size_t)Na * 2);
-        for (int64_t i = 0; i < Na; ++i) vox.emplace(key3(acoord[3*i], acoord[3*i+1], acoord[3*i+2]), (int)i);
-
-        std::vector<int> vcoord;
-        std::unordered_map<uint64_t, int> vmap;
-        vmap.reserve((size_t)Na * 3);
-        for (int64_t i = 0; i < Na; ++i)
-            for (int dx = 0; dx < 2; ++dx) for (int dy = 0; dy < 2; ++dy) for (int dz = 0; dz < 2; ++dz) {
-                const int x = acoord[3*i] + dx, y = acoord[3*i+1] + dy, z = acoord[3*i+2] + dz;
-                if (vmap.emplace(key3(x, y, z), (int)(vcoord.size() / 3)).second) {
-                    vcoord.push_back(x); vcoord.push_back(y); vcoord.push_back(z);
-                }
-            }
-        const int64_t Nv = (int64_t)vcoord.size() / 3;
-        std::vector<float> fvert((size_t)Nv);
-        parallel_for(Nv, [&](int64_t b, int64_t e) {
-            for (int64_t i = b; i < e; ++i) {
-                const float p[3] = { ((float)vcoord[3*i]   / res - 0.5f) * scale,
-                                     ((float)vcoord[3*i+1] / res - 0.5f) * scale,
-                                     ((float)vcoord[3*i+2] / res - 0.5f) * scale };
-                const TriBvh::Hit h = bvh.closest(p, eps + 2 * cell);
-                const float udf = h.face >= 0 ? std::sqrt(h.dist2) : eps + 2 * cell;
-                float sdf = udf;
-                if (use_signed && h.face >= 0 && !grid.is_outside(p)) sdf = -udf;
-                fvert[i] = sdf - eps;
-            }
-        });
-        auto fval = [&](int x, int y, int z) -> float {
-            auto it = vmap.find(key3(x, y, z));
-            return it == vmap.end() ? 1e9f : fvert[it->second];
-        };
-
-        std::vector<float> dual((size_t)Na * 3);
-        std::vector<int8_t> owned((size_t)Na * 3, 0);
-        parallel_for(Na, [&](int64_t b, int64_t e) {
-            for (int64_t i = b; i < e; ++i) {
-                const int vx = acoord[3*i], vy = acoord[3*i+1], vz = acoord[3*i+2];
-                double sum[3] = {0, 0, 0};
-                int cnt = 0;
-                for (int axis = 0; axis < 3; ++axis)
-                    for (int u = 0; u < 2; ++u) for (int v = 0; v < 2; ++v) {
-                        int a0[3] = {vx, vy, vz}, a1[3];
-                        a0[(axis + 1) % 3] += u;
-                        a0[(axis + 2) % 3] += v;
-                        a1[0] = a0[0]; a1[1] = a0[1]; a1[2] = a0[2];
-                        a1[axis] += 1;
-                        const float v1 = fval(a0[0], a0[1], a0[2]);
-                        const float v2 = fval(a1[0], a1[1], a1[2]);
-                        const bool c12 = v1 < 0 && v2 >= 0, c21 = v1 >= 0 && v2 < 0;
-                        if (c12 || c21) {
-                            const float t = -v1 / (v2 - v1);
-                            double pt[3] = {(double)a0[0], (double)a0[1], (double)a0[2]};
-                            pt[axis] += t;
-                            for (int k = 0; k < 3; ++k) sum[k] += pt[k];
-                            ++cnt;
-                        }
-                        if (u == 1 && v == 1) owned[3*i + axis] = c12 ? 1 : (c21 ? -1 : 0);
-                    }
-                if (cnt) for (int k = 0; k < 3; ++k) dual[3*i+k] = (float)(sum[k] / cnt);
-                else { dual[3*i] = vx + 0.5f; dual[3*i+1] = vy + 0.5f; dual[3*i+2] = vz + 0.5f; }
-            }
-        });
-
-        static const int OFF[3][4][3] = {
-            {{0,0,0}, {0,0,1}, {0,1,1}, {0,1,0}},
-            {{0,0,0}, {1,0,0}, {1,0,1}, {0,0,1}},
-            {{0,0,0}, {0,1,0}, {1,1,0}, {1,0,0}},
-        };
-        std::vector<int32_t> qfaces;
-        qfaces.reserve((size_t)Na * 6);
-        std::vector<uint8_t> used((size_t)Na, 0);
-        for (int64_t i = 0; i < Na; ++i) {
-            const int vx = acoord[3*i], vy = acoord[3*i+1], vz = acoord[3*i+2];
-            for (int axis = 0; axis < 3; ++axis) {
-                const int dir = owned[3*i + axis];
-                if (!dir) continue;
-                int q[4];
-                bool ok = true;
-                for (int k = 0; k < 4 && ok; ++k) {
-                    auto it = vox.find(key3(vx + OFF[axis][k][0], vy + OFF[axis][k][1], vz + OFF[axis][k][2]));
-                    if (it == vox.end()) ok = false;
-                    else q[k] = it->second;
-                }
-                if (!ok) continue;
-                static const int S1N[6] = {0, 1, 2, 0, 2, 3};
-                static const int S1P[6] = {0, 2, 1, 0, 3, 2};
-                const int* sp = dir > 0 ? S1P : S1N;
-                for (int k = 0; k < 6; ++k) qfaces.push_back(q[sp[k]]);
-                for (int k = 0; k < 4; ++k) used[q[k]] = 1;
-            }
-        }
-        if (qfaces.empty()) {
-            if (use_signed && n_udf >= 100) continue;
-            return out;
-        }
-
-        Mesh built;
-        std::vector<int32_t> remap((size_t)Na, -1);
-        int nv2 = 0;
-        for (int64_t i = 0; i < Na; ++i)
-            if (used[i]) {
-                remap[i] = nv2++;
-                built.verts.push_back((dual[3*i]   / res - 0.5f) * scale);
-                built.verts.push_back((dual[3*i+1] / res - 0.5f) * scale);
-                built.verts.push_back((dual[3*i+2] / res - 0.5f) * scale);
-            }
-        built.faces.resize(qfaces.size());
-        for (size_t k = 0; k < qfaces.size(); ++k) built.faces[k] = remap[qfaces[k]];
-
-        if (use_signed) {
-            // Faces whose centroids sit in the interior are the inner wall,
-            // including where a few edges still join it to the outer shell.
-            {
-                std::vector<int32_t> kept;
-                kept.reserve(built.faces.size());
-                const int V = built.V();
-                for (int f = 0; f < built.F(); ++f) {
-                    const int ia = built.faces[3*f], ib = built.faces[3*f+1], ic = built.faces[3*f+2];
-                    if (ia < 0 || ib < 0 || ic < 0 || ia >= V || ib >= V || ic >= V) continue;
-                    const float q[3] = {
-                        (built.verts[3*ia] + built.verts[3*ib] + built.verts[3*ic]) / 3.f,
-                        (built.verts[3*ia+1] + built.verts[3*ib+1] + built.verts[3*ic+1]) / 3.f,
-                        (built.verts[3*ia+2] + built.verts[3*ib+2] + built.verts[3*ic+2]) / 3.f,
-                    };
-                    if (!grid.is_outside(q)) continue;
-                    kept.push_back(ia); kept.push_back(ib); kept.push_back(ic);
-                }
-                if ((int)kept.size() / 3 > built.F() / 5) built.faces.swap(kept);
-                std::vector<int> remap((size_t)V, -1);
-                std::vector<float> nv;
-                for (size_t i = 0; i < built.faces.size(); ++i) {
-                    const int v = built.faces[i];
-                    if (remap[v] < 0) {
-                        remap[v] = (int)(nv.size() / 3);
-                        nv.insert(nv.end(), &built.verts[3*v], &built.verts[3*v] + 3);
-                    }
-                    built.faces[i] = remap[v];
-                }
-                built.verts.swap(nv);
-            }
-            std::vector<float> failed_boxes;
-            if (!screen_shell(built, grid, failed_boxes)) {
-                // Dominant component sits in the interior (sign came out inverted).
-                // A cell-count cutoff does not catch this — an inverted field still
-                // keeps about half the band. Rebuild the unsigned tube.
-                continue;
-            }
-        }
-        out = std::move(built);
-        active_voxels = Na;
-        built_ok = true;
-
-        const int faces_after = out.F();
-        int faces_before = faces_after;
-        int removed_faces = 0;
-        if (use_signed && n_sdf > 0 && n_udf > n_sdf) {
-            faces_before = (int)std::llround((double)faces_after * (double)n_udf / (double)n_sdf);
-            if (faces_before < faces_after) faces_before = faces_after;
-            removed_faces = faces_before - faces_after;
-        }
-        const double shell_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_shell).count();
-        printf("  remesh postproc: outer shell faces %d -> %d (removed %d inner-wall faces) in %.3fs (flood %.3fs)%s\n",
-               faces_before, faces_after, removed_faces, shell_s, flood_s,
-               use_signed ? "" : " (unsigned fallback)");
-        fflush(stdout);
+    });
+    std::vector<int> acoord_u;
+    for (size_t i = 0; i < cand_cells.size(); ++i) {
+        if (!act_u[i]) continue;
+        const int64_t c = cand_cells[i];
+        acoord_u.push_back((int)(c / ((int64_t)res * res)));
+        acoord_u.push_back((int)((c / res) % res));
+        acoord_u.push_back((int)(c % res));
     }
-    if (!built_ok) return out;
-
-    // Voxel cracks leave a handful of boundary edges on curved shells. Close
-    // only short loops; a real opening is longer than this and stays open.
-    if (out.F() > 0) {
-        const int filled = fill_small_holes(out.faces, 192);
-        if (filled) {
-            printf("  remesh postproc: filled %d short remesh cracks\n", filled);
-            fflush(stdout);
-        }
+    cand_cells.clear(); cand_cells.shrink_to_fit();
+    const int64_t Na = (int64_t)acoord_u.size() / 3;
+    if (Na < 100) {
+        fprintf(stderr, "  remesh: only %lld active voxels; skipping remesh\n", (long long)Na);
+        return out;
     }
+
+    std::vector<int> vcoord;
+    std::unordered_map<uint64_t, int> vmap;
+    vmap.reserve((size_t)Na * 3);
+    for (int64_t i = 0; i < Na; ++i)
+        for (int dx = 0; dx < 2; ++dx) for (int dy = 0; dy < 2; ++dy) for (int dz = 0; dz < 2; ++dz) {
+            const int x = acoord_u[3 * i] + dx, y = acoord_u[3 * i + 1] + dy, z = acoord_u[3 * i + 2] + dz;
+            if (vmap.emplace(key3(x, y, z), (int)(vcoord.size() / 3)).second) {
+                vcoord.push_back(x); vcoord.push_back(y); vcoord.push_back(z);
+            }
+        }
+    const int64_t Nv = (int64_t)vcoord.size() / 3;
+    std::vector<float> fu((size_t)Nv), fs((size_t)Nv);
+    parallel_for(Nv, [&](int64_t b, int64_t e) {
+        for (int64_t i = b; i < e; ++i) {
+            const float p[3] = { ((float)vcoord[3 * i]     / res - 0.5f) * scale,
+                                 ((float)vcoord[3 * i + 1] / res - 0.5f) * scale,
+                                 ((float)vcoord[3 * i + 2] / res - 0.5f) * scale };
+            const TriBvh::Hit h = bvh.closest(p, eps + 2 * cell);
+            const float udf = h.face >= 0 ? std::sqrt(h.dist2) : eps + 2 * cell;
+            fu[i] = udf - eps;
+            float sdf = udf;
+            if (grid.ready && h.face >= 0 && !grid.is_outside(p)) sdf = -udf;
+            fs[i] = sdf - eps;
+        }
+    });
+    vcoord.clear(); vcoord.shrink_to_fit();
+
+    Mesh unsigned_shell = contour_mesh(acoord_u, vmap, fu, res, scale);
+    if (unsigned_shell.F() == 0) return out;
+    int faces_before = unsigned_shell.F();
+    int removed_faces = 0;
+    const char* note = " (unsigned fallback)";
+    const int64_t active_voxels = Na;
+    if (grid.ready) {
+        // Same cells as the unsigned tube. The signed field is negative on both
+        // sides of the inner wall, so those cells emit nothing; sign changes only
+        // on the outer sheet. Filtering by the cell center drops outer cells
+        // whose center fell inside a surface voxel and opens the shell.
+        Mesh signed_shell = contour_mesh(acoord_u, vmap, fs, res, scale);
+        out = choose_shell(std::move(unsigned_shell), std::move(signed_shell), grid, eps, band,
+                           faces_before, removed_faces, note);
+    } else {
+        out = std::move(unsigned_shell);
+        removed_faces = 0;
+        note = " (unsigned fallback)";
+    }
+    const double shell_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_shell).count();
+    printf("  remesh postproc: outer shell faces %d -> %d (removed %d inner-wall faces) in %.3fs (flood %.3fs, seal %.3fs)%s\n",
+           faces_before, out.F(), removed_faces, shell_s, grid.flood_s, grid.seal_s, note);
+    fflush(stdout);
+    if (out.F() == 0) return out;
 
     // Project the dual vertices back onto the input surface (reference:
     // remesh_project=0.9, o_voxel/postprocess.py::to_glb -> remeshing.py §8).

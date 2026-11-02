@@ -7,13 +7,16 @@
 // The reference implicit function is f = UDF − eps. That zero set is the
 // boundary of a tube, so a closed solid comes out as two walls about 2·eps
 // apart. Sign does not come from face winding (a decoded Pixal shell is a
-// thin, inconsistently wound band). Empty cells are flood-filled from the
-// domain boundary; reachable cells are exterior and everything sealed off,
-// including the hollow interior, is inside. The extracted level is the
-// boundary of that exterior, offset by eps — the outer wall only. Where the
-// flood can walk around the surface, that region stays on the unsigned band.
-// A component that still lands inside-out or in the interior is replaced by
-// the unsigned band. Quad assembly and project_back are otherwise unchanged.
+// thin, inconsistently wound band). Empty cells in the narrow band are
+// flood-filled from outside the vertex box; reachable cells are exterior and
+// everything the surface seals off, including the hollow interior, is inside.
+// The extracted level is the boundary of that exterior, offset by eps — the
+// outer wall only. Where the flood can walk around the surface, that region
+// stays on the unsigned band. Per component, the signed shell is kept only
+// when it still covers the unsigned outer sheet (every outer vertex within
+// 1.5·eps), adds no open edges, and does not drop or split a real piece.
+// Otherwise that component keeps the double shell. Quad assembly and
+// project_back are otherwise unchanged.
 #pragma once
 #include "dual_grid.h"
 
