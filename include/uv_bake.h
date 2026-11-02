@@ -57,7 +57,47 @@ void decimate_qem(const std::vector<float>& verts, int V, const std::vector<int3
 // frac*(largest component's). Removes decode floaters + spurious ground fragments (which
 // shatter our mesh into 50+ pieces) while keeping legitimately large secondary shells
 // (a hollow vase's inner+outer surface). In place; returns the number of components dropped.
+//
+// Face-count-only cut. The post-QEM pass uses this at 3% so an inward skin
+// that sits against the wall (under 3% of the body) is removed, matching
+// shipped. The pre-decimation pass is drop_pre_decimation_components.
 int drop_small_components(std::vector<float>& verts, std::vector<int32_t>& faces, float frac = 0.02f);
+
+// World length of one remesh cell. Matches remesh_narrow_band_dc: output
+// vertices are (grid/res - 0.5) * (res + 3*band)/res, so one grid step is
+// (res + 3*band) / res^2.
+inline float remesh_voxel_world(int res, int band) {
+    if (res < 1) res = 1;
+    const int b = band < 1 ? 1 : band;
+    return (float)(res + 3 * b) / ((float)res * (float)res);
+}
+
+// A component whose closest vertex is within this many remesh voxels of the
+// main body is touching it or sitting right against it (a remesh crack, an
+// ear, an antenna). Farther than this, and under 3% of the body's faces, it
+// is a detached shell.
+constexpr float kPreDecimAttachVoxels = 3.f;
+
+// Pre-decimation filter. Largest component is the body.
+// - face share < 2%: dropped
+// - face share < 3% and gap > kPreDecimAttachVoxels: dropped
+// - face share >= 3% (feet at ~3.9%): kept even when detached
+// - face share in [2%, 3%) and within the attach distance: kept
+// `voxel_world` is remesh_voxel_world(res, band). Logs every 2–3% decision
+// with face share and gap, and summarizes pieces under 2% (those are dropped
+// with no gap search). Prints
+// `remesh postproc: components took X s (gap search Y s)`.
+// Returns components dropped. Pre-decimation only; after QEM use
+// drop_small_components(..., 0.03f).
+int drop_pre_decimation_components(std::vector<float>& verts, std::vector<int32_t>& faces,
+                                   float voxel_world);
+
+// xatlas PackOptions::padding, in packer pixels. Full gutter when the atlas has
+// about 4+ texels per face (the 250k / 1024 bake). Fades to 0 as the mesh
+// approaches 1 texel of atlas per face, which is the historical padding-0 pack:
+// a fixed padding on a chart-heavy mesh inflates the packer atlas and the
+// downscale into the bake atlas throws away texels.
+uint32_t xatlas_pack_padding(int texsize, int faces);
 
 // Fill small boundary loops (holes) with a centroid fan, port of CuMesh fill_holes
 // (clean_up.cu): loops whose perimeter is below max_perimeter get one new vertex at the

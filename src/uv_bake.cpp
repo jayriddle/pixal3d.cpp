@@ -19,6 +19,7 @@
 #include <memory>
 #include <queue>
 #include <unordered_map>
+#include <unordered_set>
 #include <array>
 
 namespace trellis {
@@ -236,7 +237,28 @@ void telea_inpaint(std::vector<uint8_t>& base, std::vector<uint8_t>& mr,
         }
     }
 }
+
 }  // namespace
+
+uint32_t xatlas_pack_padding(int texsize, int faces) {
+    if (texsize < 1) texsize = 1;
+    if (faces < 1) faces = 1;
+    // Bake-pixel gutter we'd like when the packer hits its ~1024 estimate:
+    // max(8, texsize/128). xatlas padding is in packer pixels and the gap
+    // between chart contents is ~2*padding, mapped by texsize/packer_width.
+    // padding = gutter * 1024 / (2 * texsize) realizes that when the packer
+    // width is ~1024. A real 1024 bake of ~213k faces measured ~6.1 px, because
+    // the packer atlas landed a bit over 1024.
+    const int gutter = std::max(8, texsize / 128);
+    const int full = std::max(2, std::min(64, (gutter * 512 + texsize - 1) / texsize));
+    // Room in the atlas. >= ~4 texels/face (250k on 1024 is 4.2) keeps the full
+    // gutter. At ~1 texel/face (1,000,000 on 1024) padding goes to 0: a fixed
+    // padding of 4 there grew the packer to ~2338 px and the downscale into
+    // 1024 left ~0.19 texels/face, against ~0.77 with padding 0.
+    const double tpf = (double)texsize * (double)texsize / (double)faces;
+    const double room = std::min(1.0, std::max(0.0, (tpf - 1.0) / 3.0));
+    return (uint32_t)std::max(0, std::min(64, (int)std::lround((double)full * room)));
+}
 
 void decimate_cluster(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
                       const std::vector<float>& pbr6, int grid,
@@ -484,6 +506,325 @@ int drop_small_components(std::vector<float>& verts, std::vector<int32_t>& faces
     std::vector<int32_t> kf; kf.reserve(faces.size());
     for (size_t f = 0; f < F; ++f)
         if (fc[find(faces[3*f])] >= thresh)
+            for (int k = 0; k < 3; ++k) kf.push_back(faces[3*f + k]);
+    std::vector<int> remap((size_t)V, -1);
+    std::vector<float> nv; nv.reserve(verts.size());
+    for (size_t i = 0; i < kf.size(); ++i) {
+        int v = kf[i];
+        if (remap[v] < 0) { remap[v] = (int)(nv.size() / 3); nv.insert(nv.end(), &verts[3*v], &verts[3*v] + 3); }
+        kf[i] = remap[v];
+    }
+    verts.swap(nv); faces.swap(kf);
+    return dropped;
+}
+
+namespace {
+
+struct BodyGrid {
+    const float* verts = nullptr;
+    double cell = 1;
+    // Unique pack so distinct cells never share a bucket.
+    std::unordered_map<uint64_t, std::vector<int>> cells;
+
+    static uint64_t pack(int x, int y, int z) {
+        return (uint64_t)(uint32_t)(x + 0x100000) << 42 |
+               (uint64_t)(uint32_t)(y + 0x100000) << 21 |
+               (uint32_t)(z + 0x100000);
+    }
+    int ix(double v) const { return (int)std::floor(v / cell); }
+    uint64_t at(const float* p) const { return pack(ix(p[0]), ix(p[1]), ix(p[2])); }
+    static double dist2(const float* a, const float* b) {
+        const double dx = (double)a[0] - (double)b[0];
+        const double dy = (double)a[1] - (double)b[1];
+        const double dz = (double)a[2] - (double)b[2];
+        return dx * dx + dy * dy + dz * dz;
+    }
+    // Min squared distance to a body vertex that could lie within one cell of p.
+    // Cell size is the attach distance, so the 3x3x3 block is complete for that radius.
+    double probe(const float* p) const {
+        const int cx = ix(p[0]), cy = ix(p[1]), cz = ix(p[2]);
+        double best = 1e300;
+        for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    auto it = cells.find(pack(cx + dx, cy + dy, cz + dz));
+                    if (it == cells.end()) continue;
+                    for (int vi : it->second) {
+                        const double d2 = dist2(p, verts + 3 * vi);
+                        if (d2 < best) best = d2;
+                    }
+                }
+        return best;
+    }
+};
+
+double aabb_gap(const double a0[3], const double a1[3], const double b0[3], const double b1[3]) {
+    double s2 = 0;
+    for (int k = 0; k < 3; ++k) {
+        double d = 0;
+        if (a1[k] < b0[k]) d = b0[k] - a1[k];
+        else if (b1[k] < a0[k]) d = a0[k] - b1[k];
+        s2 += d * d;
+    }
+    return std::sqrt(s2);
+}
+
+// Exact gap once the within-attach probe has missed. One BFS from the candidate's
+// cells to the nearest body cells, then a vertex check on that frontier only.
+double frontier_gap(const BodyGrid& body, const float* verts, const std::vector<int>& cv) {
+    std::unordered_set<uint64_t> cand_cells;
+    cand_cells.reserve(cv.size() * 2);
+    for (int vi : cv) cand_cells.insert(body.at(verts + 3 * vi));
+    struct Node { int x, y, z, d; uint64_t parent; bool from_cand; };
+    std::unordered_map<uint64_t, int> seen;
+    std::queue<Node> q;
+    for (int vi : cv) {
+        const float* p = verts + 3 * vi;
+        const int x = body.ix(p[0]), y = body.ix(p[1]), z = body.ix(p[2]);
+        const uint64_t k = BodyGrid::pack(x, y, z);
+        if (seen.emplace(k, 0).second) q.push({x, y, z, 0, k, true});
+    }
+    int best_d = -1;
+    std::vector<Node> hits;
+    while (!q.empty()) {
+        const Node n = q.front();
+        q.pop();
+        if (best_d >= 0 && n.d > best_d) break;
+        const uint64_t k = BodyGrid::pack(n.x, n.y, n.z);
+        if (body.cells.find(k) != body.cells.end()) {
+            if (best_d < 0) best_d = n.d;
+            if (n.d == best_d) hits.push_back(n);
+            continue;
+        }
+        if (best_d >= 0) continue;
+        // Cap the search. Past this the piece is far beyond the 3-voxel attach
+        // distance; returning -1 lets the caller fall back to the box gap.
+        if (n.d >= 96) break;
+        for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (!dx && !dy && !dz) continue;
+                    const int x = n.x + dx, y = n.y + dy, z = n.z + dz;
+                    const uint64_t nk = BodyGrid::pack(x, y, z);
+                    if (!seen.emplace(nk, n.d + 1).second) continue;
+                    q.push({x, y, z, n.d + 1, k, false});
+                }
+    }
+    double best2 = 1e300;
+    std::unordered_set<uint64_t> near_cand;
+    for (const Node& h : hits) if (h.parent) near_cand.insert(h.parent);
+    for (int vi : cv) {
+        const float* p = verts + 3 * vi;
+        if (!near_cand.count(body.at(p)) && !hits.empty()) continue;
+        const int cx = body.ix(p[0]), cy = body.ix(p[1]), cz = body.ix(p[2]);
+        for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    auto it = body.cells.find(BodyGrid::pack(cx + dx, cy + dy, cz + dz));
+                    if (it == body.cells.end()) continue;
+                    for (int bi : it->second) best2 = std::min(best2, BodyGrid::dist2(p, verts + 3 * bi));
+                }
+    }
+    // The meeting cell may be more than one step from the candidate vertex that
+    // owns the closest pair. Fall back to every candidate vertex against the hit
+    // body cells if the frontier filter found nothing.
+    if (!(best2 < 1e299)) {
+        for (const Node& h : hits) {
+            auto it = body.cells.find(BodyGrid::pack(h.x, h.y, h.z));
+            if (it == body.cells.end()) continue;
+            for (int vi : cv)
+                for (int bi : it->second)
+                    best2 = std::min(best2, BodyGrid::dist2(verts + 3 * vi, verts + 3 * bi));
+        }
+    }
+    // No body vertex found within the cap. Do not sqrt() a sentinel.
+    if (!(best2 < 1e299)) return -1.0;
+    return std::sqrt(best2);
+}
+
+}  // namespace
+
+int drop_pre_decimation_components(std::vector<float>& verts, std::vector<int32_t>& faces,
+                                   float voxel_world) {
+    const auto t_all = std::chrono::steady_clock::now();
+    auto secs = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+        return std::chrono::duration<double>(b - a).count();
+    };
+    const int V = (int)verts.size() / 3;
+    const size_t F = faces.size() / 3;
+    if (V == 0 || F == 0 || !(voxel_world > 0.f)) return 0;
+    std::vector<int> par((size_t)V);
+    for (int i = 0; i < V; ++i) par[i] = i;
+    auto find = [&](int x) { while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+    auto uni  = [&](int a, int b) { int ra = find(a), rb = find(b); if (ra != rb) par[ra] = rb; };
+    for (size_t f = 0; f < F; ++f) { uni(faces[3*f], faces[3*f+1]); uni(faces[3*f+1], faces[3*f+2]); }
+
+    std::unordered_map<int, int> fc;
+    for (size_t f = 0; f < F; ++f) fc[find(faces[3*f])]++;
+    int main_root = -1, maxfc = 0;
+    for (auto& kv : fc) if (kv.second > maxfc) { maxfc = kv.second; main_root = kv.first; }
+    if (main_root < 0 || maxfc <= 0) return 0;
+    const int thresh2 = (int)(0.02 * maxfc);
+    const int thresh3 = (int)(0.03 * maxfc);
+
+    std::vector<int> body_verts;
+    body_verts.reserve((size_t)maxfc);
+    std::vector<uint8_t> seen((size_t)V, 0);
+    for (size_t f = 0; f < F; ++f) {
+        if (find(faces[3*f]) != main_root) continue;
+        for (int k = 0; k < 3; ++k) {
+            const int v = faces[3*f + k];
+            if (!seen[v]) { seen[v] = 1; body_verts.push_back(v); }
+        }
+    }
+    const double attach = (double)kPreDecimAttachVoxels * (double)voxel_world;
+    const double attach2 = attach * attach;
+    double bmin[3] = {1e300, 1e300, 1e300}, bmax[3] = {-1e300, -1e300, -1e300};
+    for (int vi : body_verts) {
+        const float* p = verts.data() + 3 * vi;
+        for (int k = 0; k < 3; ++k) {
+            bmin[k] = std::min(bmin[k], (double)p[k]);
+            bmax[k] = std::max(bmax[k], (double)p[k]);
+        }
+    }
+
+    struct Item { int root; int faces; double gap_vox; bool drop; bool have_gap; const char* why; };
+    std::vector<Item> items;
+    std::vector<int> band_roots;
+    int n_under2 = 0, under2_largest = 0;
+    for (auto& kv : fc) {
+        if (kv.first == main_root) continue;
+        if (kv.second >= thresh3) continue;                 // feet and other large parts
+        if (kv.second < thresh2) {
+            ++n_under2;
+            under2_largest = std::max(under2_largest, kv.second);
+            items.push_back({kv.first, kv.second, 0, true, false, "below 2%"});
+        } else {
+            band_roots.push_back(kv.first);
+        }
+    }
+
+    const auto t_gap = std::chrono::steady_clock::now();
+    BodyGrid body;
+    if (!band_roots.empty()) {
+        body.verts = verts.data();
+        body.cell = attach > 0 ? attach : (double)voxel_world;
+        body.cells.reserve(body_verts.size() / 8 + 1);
+        for (int vi : body_verts) {
+            const float* p = verts.data() + 3 * vi;
+            body.cells[body.at(p)].push_back(vi);
+        }
+    }
+    std::vector<int> stamp((size_t)V, 0);
+    int stamp_id = 1;
+    for (int root : band_roots) {
+        std::vector<int> cv;
+        double cmin[3] = {1e300, 1e300, 1e300}, cmax[3] = {-1e300, -1e300, -1e300};
+        const int id = ++stamp_id;
+        for (size_t f = 0; f < F; ++f) {
+            if (find(faces[3 * f]) != root) continue;
+            for (int k = 0; k < 3; ++k) {
+                const int v = faces[3 * f + k];
+                const float* p = verts.data() + 3 * v;
+                for (int a = 0; a < 3; ++a) {
+                    cmin[a] = std::min(cmin[a], (double)p[a]);
+                    cmax[a] = std::max(cmax[a], (double)p[a]);
+                }
+                if (stamp[v] != id) { stamp[v] = id; cv.push_back(v); }
+            }
+        }
+        const double box_gap = aabb_gap(cmin, cmax, bmin, bmax);
+        double gap;
+        bool against = false;
+        if (box_gap > attach) {
+            gap = box_gap;
+        } else {
+            double best2 = 1e300;
+            auto consider = [&](int vi) {
+                const double d2 = body.probe(verts.data() + 3 * vi);
+                if (d2 < best2) best2 = d2;
+                if (d2 <= attach2) against = true;
+            };
+            // Stride first so a part sitting on the body exits without a full scan.
+            const size_t step = std::max<size_t>(1, cv.size() / 4096);
+            for (size_t i = 0; i < cv.size() && !against; i += step) consider(cv[i]);
+            // Emscripten production builds link without pthreads. Constructing
+            // std::thread then throws and aborts the bake. The serial scan
+            // below makes the same keep/drop decision.
+#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
+            if (!against && cv.size() > 8192) {
+                const unsigned nt = std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
+                std::atomic<int> stop{0};
+                std::vector<double> local(nt, 1e300);
+                std::vector<std::thread> ts;
+                for (unsigned t = 0; t < nt; ++t) {
+                    ts.emplace_back([&, t] {
+                        double b2 = 1e300;
+                        for (size_t i = t; i < cv.size(); i += nt) {
+                            if (stop.load(std::memory_order_relaxed)) break;
+                            const double d2 = body.probe(verts.data() + 3 * cv[i]);
+                            if (d2 < b2) b2 = d2;
+                            if (d2 <= attach2) { stop.store(1, std::memory_order_relaxed); break; }
+                        }
+                        local[t] = b2;
+                    });
+                }
+                for (auto& th : ts) th.join();
+                for (double b2 : local) {
+                    if (b2 < best2) best2 = b2;
+                    if (b2 <= attach2) against = true;
+                }
+            } else
+#endif
+            if (!against) {
+                for (int vi : cv) {
+                    consider(vi);
+                    if (against) break;
+                }
+            }
+            if (against) gap = std::sqrt(best2);
+            else {
+                const double g = frontier_gap(body, verts.data(), cv);
+                // Negative means the BFS cap was hit and no body vertex was
+                // found. That piece is far past the attach distance.
+                gap = g >= 0.0 ? g : std::max(box_gap, body.cell * 96.0);
+            }
+        }
+        const bool detached = !(gap <= attach);
+        items.push_back({root, fc[root], gap / (double)voxel_world, detached, true,
+                         detached ? "detached" : "against body"});
+    }
+    const double gap_s = secs(t_gap, std::chrono::steady_clock::now());
+
+    if (n_under2 > 16) {
+        printf("  component drop: %d components below 2%% (largest %d faces, %.2f%% of %d)\n",
+               n_under2, under2_largest, 100.0 * under2_largest / maxfc, maxfc);
+        items.erase(std::remove_if(items.begin(), items.end(), [](const Item& it) {
+            return it.drop && !it.have_gap;
+        }), items.end());
+    }
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.faces > b.faces; });
+    for (const Item& it : items) {
+        if (it.have_gap)
+            printf("  component %s: faces=%d share=%.2f%% of %d gap=%.2f voxels (%s)\n",
+                   it.drop ? "drop" : "keep", it.faces, 100.0 * it.faces / maxfc, maxfc, it.gap_vox, it.why);
+        else
+            printf("  component drop: faces=%d share=%.2f%% of %d gap=n/a (%s)\n",
+                   it.faces, 100.0 * it.faces / maxfc, maxfc, it.why);
+    }
+    std::unordered_map<int, bool> kill;
+    for (auto& kv : fc)
+        if (kv.first != main_root && kv.second < thresh2) kill[kv.first] = true;
+    for (const Item& it : items)
+        if (it.drop) kill[it.root] = true;
+    const int dropped = (int)kill.size();
+    printf("  remesh postproc: components took %.3fs (gap search %.3fs)\n",
+           secs(t_all, std::chrono::steady_clock::now()), gap_s);
+    fflush(stdout);
+    if (dropped == 0) return 0;
+    std::vector<int32_t> kf; kf.reserve(faces.size());
+    for (size_t f = 0; f < F; ++f)
+        if (!kill[find(faces[3*f])])
             for (int k = 0; k < 3; ++k) kf.push_back(faces[3*f + k]);
     std::vector<int> remap((size_t)V, -1);
     std::vector<float> nv; nv.reserve(verts.size());
@@ -782,8 +1123,14 @@ BakedMesh uv_chart_project(const std::vector<float>& verts, int V, const std::ve
             }
     }
 
-    // shelf packing: global scale found by bisection so everything fits with padding
-    const int pad = 2;
+    // shelf packing: global scale found by bisection so everything fits with padding.
+    // The slot is content + 2*pad and the chart origin is inset by pad, so the
+    // content-to-content gutter is 2*pad bake pixels. The width tracks the
+    // xatlas gutter (and fades the same way when the mesh is dense for the atlas).
+    const uint32_t pack_full = xatlas_pack_padding(texsize, 1);
+    const uint32_t pack_pad = xatlas_pack_padding(texsize, F);
+    const float pack_room = pack_full ? (float)pack_pad / (float)pack_full : 0.f;
+    const int pad = std::max(0, (int)std::lround(std::max(4, texsize / 256) * pack_room));
     std::vector<int> order(cs.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = (int)i;
     float total = 0;
@@ -1195,15 +1542,29 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
     worker.join();
     delete done;
 
-    // Reference packing (spec 27 §6.3): stock PackOptions — padding 0,
-    // resolution 0 (xatlas grows a single ~1024² atlas at its own density
-    // estimate), blockAlign false, bilinear true — and the binding then
-    // divides UVs by the final atlas width/height, so charts always span the
-    // FULL [0,1]² regardless of the packer's internal resolution. Density and
-    // occupancy at the bake size come from this normalization, not from
-    // packing at the bake resolution; chart-to-chart bleed at 0 padding is
-    // handled by the inpaint (as in the reference).
+    // Packing diverges from the reference's stock PackOptions (spec 27 §6.3,
+    // padding 0) by inserting a gutter. resolution stays 0 so xatlas still
+    // grows a single ~1024² atlas (multi-atlas mode is not composited here);
+    // blockAlign stays off; bilinear stays on so the occupancy mask includes
+    // the bilinear footprint. UVs are divided by the final atlas width/height
+    // below — the same normalization as the reference binding — so the gutter
+    // xatlas left between charts is mapped into the bake atlas along with the
+    // charts. Density still comes from that normalization, not from packing
+    // at the bake resolution.
     xatlas::PackOptions po;
+    const int packed_faces = (int)big_faces.size();
+    const uint32_t full_pad = xatlas_pack_padding(texsize, 1);
+    po.padding = xatlas_pack_padding(texsize, packed_faces);
+    po.resolution = 0;
+    po.bilinear = true;
+    po.blockAlign = false;
+    if (po.padding < full_pad) {
+        const double tpf = (double)texsize * (double)texsize / (double)std::max(packed_faces, 1);
+        fprintf(stderr,
+                "  uv_bake: %d faces in a %d atlas (%.2f atlas texels/face); "
+                "pack padding %u (a full gutter of %u would inflate the packer and shrink the charts)\n",
+                packed_faces, texsize, tpf, po.padding, full_pad);
+    }
     xatlas::PackCharts(atlas, po);
     if (atlas->meshCount == 0 || atlas->width == 0) { xatlas::Destroy(atlas); return out; }
 
@@ -1425,7 +1786,10 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
     xatlas::Destroy(atlas);
 
     telea_inpaint(out.base, out.mr, mask, T, 3, 1);
-    printf("  uv_bake: atlas %dx%d (xatlas %dx%d), Vo=%zu Fo=%d\n", T, T, W, H, out.verts.size()/3, FoAll);
+    // ~2*padding packer pixels between chart contents, scaled into the bake atlas.
+    const float bake_gutter = (W > 0) ? (2.f * (float)po.padding * (float)T / (float)W) : 0.f;
+    printf("  uv_bake: atlas %dx%d (xatlas %dx%d, pack padding %u, bake gutter ~%.1f px), Vo=%zu Fo=%d\n",
+           T, T, W, H, po.padding, bake_gutter, out.verts.size()/3, FoAll);
     fflush(stdout);
     return out;
 }

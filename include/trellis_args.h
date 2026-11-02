@@ -74,7 +74,11 @@ struct TrellisParams {
                                 //   2 @1024 — which suppresses the res-1024 "outer-skin"
                                 //   speckle (issue #22). >0 forces that width (e.g. 1 for
                                 //   the thin-wall reference look, 2 for a thicker shell).
-    int  decim    = -1;         // decimation cluster grid   (-1 => per-cascade default)
+    int  decim    = -1;         // decimation cluster grid   (-1 => quadric / QEM)
+    // --faces N: quadric (QEM) face target before the UV bake. -1 = path default
+    // from qem_face_target(). Ignored when --decim selects the cluster grid
+    // (including --decim 0, which keeps every face).
+    int  faces    = -1;
     int  tex      = -1;         // UV atlas size in px        (-1 => per-cascade default)
     int  tex_res  = -1;         // texture PBR resolution: -1 => auto (drop dense res-1024 tex to
                                 //   512, whose clean coarse PBR bakes onto the res-1024 mesh
@@ -103,6 +107,25 @@ struct TrellisParams {
     void set_res(int res) {
         if (res <= 512) { cascade = false; hr_res = 512; }
         else            { cascade = true;  hr_res = res; }
+    }
+
+    // Pre-bake quadric target. `pixal` is the --views / --sv-image tail.
+    //
+    // Pixal used to hard-code 1,000,000, matching inference_mv.py. A typical
+    // remesh is already under that (measured ~820k faces), so QEM never ran
+    // and a 1024 atlas (~628k occupied texels) left ~39% of faces with no
+    // texel center. 250000 is the middle of the 200–300k band: ~3× fewer
+    // triangles than that mesh, and 1024²/250k ≈ 4 atlas texels per face
+    // before packing loss — enough for a chart gutter and a texel center on
+    // the smooth body, where the off-color specks showed up. 300k is the
+    // TRELLIS.2 cascade default, but that path bakes a 2048 atlas (4× the
+    // texels); on WarpForm's --atlas 1024 it is the tight end of the band.
+    // TRELLIS.2 itself stays 300000 (cascade) / 150000 (--res 512) when
+    // --faces is omitted.
+    int qem_face_target(bool pixal) const {
+        if (faces > 0) return faces;
+        if (pixal) return 250000;
+        return cascade ? 300000 : 150000;
     }
 };
 

@@ -121,8 +121,9 @@ The most useful ones:
 | `--res 512\|1024\|1536` | geometry resolution (512 = light path, no cascade) |
 | `--bg-removal threshold\|birefnet` | default **auto**: pre-matted images keep their alpha, otherwise the BiRefNet matte (~13s on GPU). The plain white-bg keyer cuts specular highlights out of the alpha — the flow then generates holes there — so it is opt-in only |
 | `--no-texture` | geometry only |
-| `--decim GRID` | legacy cluster-grid decimation (default: quadric simplify to 300K faces @1024 / 150K @512; `0` = keep the full-res mesh) |
-| `--atlas PX` | UV atlas size (default 2048 @1024 / 1024 @512) |
+| `--decim GRID` | legacy cluster-grid decimation. Default is quadric simplify (`--faces`); `0` = keep the full-res mesh. `--faces` is ignored when this is set |
+| `--faces N` | quadric (QEM) face target before the UV bake (default **250000** for Pixal `--views` / `--sv-image`; **300000** on the TRELLIS.2 cascade, **150000** at `--res 512`) |
+| `--atlas PX` | UV atlas size (default 2048 @1024 / 1024 @512; Pixal `--views` / `--sv-image` default 4096) |
 | `--box-uv` | voxel-native 6-way box projection instead of the default xatlas unwrap (O(faces), faster, looser packing) |
 | `--seed N` | RNG seed |
 | `--require-gpu` | fail instead of falling back to the (very slow, RAM-hungry) CPU path |
@@ -244,10 +245,17 @@ For the currently published MV set, `--models DIR` needs `dinov3.gguf`, `pixal3d
 `shape_dec.gguf`, `tex_dec.gguf`. Per-view DINOv3 features are pixel-aligned-projected into a
 shared 3D grid (`ProjGrid`) and averaged over views (`ProjectAttention`); the shape/texture stages
 additionally fuse in NAF high-resolution image features. See `docs/spec/30-pixal3d-cond.md` for
-the full conditioning spec. Face budget (1M), UV atlas (4096px) and remesh band (1) default to the
-reference pipeline's own values in this mode (override with `--decim`/`--atlas`/`--band` as usual);
-everything after SLAT sampling (decode/remesh/decimate/UV/bake/GLB export) is the same TRELLIS.2
-postprocess code.
+the full conditioning spec. UV atlas (4096px) and remesh band (1) default to the
+reference pipeline's values in this mode (`--atlas` / `--band` override them). The pre-bake
+quadric target defaults to **250000** faces (`--faces N` overrides it; the TRELLIS.2 path keeps
+300000 on the cascade and 150000 at `--res 512`). On a real Pixal `--atlas 1024` bake (about 213k faces) that
+lands at **2.16 texels per face** and a **~6.1 px** chart gutter. The reference 1,000,000
+target sits above a typical Pixal remesh, so the quadric pass was not reducing the mesh.
+`--decim` selects the legacy cluster grid and ignores `--faces`. Everything after SLAT sampling
+(decode/remesh/decimate/UV/bake/GLB export) is the same TRELLIS.2 postprocess code. xatlas
+charts are packed with a gutter that fades out when the mesh is already dense for the atlas
+(a fixed pad on a 1,000,000-face 1024 bake inflated the packer and cut texels per face below
+the old padding-0 result). The bake log prints the realized width (`bake gutter ~N px`).
 
 ## Pipeline
 
