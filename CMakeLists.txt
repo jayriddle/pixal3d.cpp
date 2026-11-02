@@ -445,6 +445,11 @@ add_executable(trellis-test-bake-pack src/test_bake_pack.cpp)
 target_link_libraries(trellis-test-bake-pack PRIVATE trellis_core Threads::Threads)
 set_target_properties(trellis-test-bake-pack PROPERTIES BUILD_RPATH "${GGML_RPATH}")
 
+# Synthetic double-wall check: remesh must emit one outward shell (no weights).
+add_executable(trellis-test-remesh-shell src/test_remesh_shell.cpp)
+target_link_libraries(trellis-test-remesh-shell PRIVATE trellis_core Threads::Threads)
+set_target_properties(trellis-test-remesh-shell PROPERTIES BUILD_RPATH "${GGML_RPATH}")
+
 add_executable(trellis-server src/trellis-server.cpp src/trellis_cli.cpp src/trellis_args.cpp)
 target_include_directories(trellis-server PRIVATE ${CMAKE_SOURCE_DIR}/thirdparty/cpp-httplib)
 target_link_libraries(trellis-server PRIVATE trellis_core Threads::Threads)

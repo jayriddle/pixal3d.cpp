@@ -1,9 +1,18 @@
-// Narrow-band UDF dual-contouring remesh, ported from the reference
+// Narrow-band dual-contouring remesh, ported from the reference
 // (CuMesh remeshing.py::remesh_narrow_band_dc + simple_dual_contour.cu; see
 // docs/spec/27-reference-postprocess.md §4). Rebuilds a noisy voxel-derived
-// mesh as the closed, consistently-oriented offset surface at distance
-// eps = band·scale/res around it — one watertight manifold that downstream
-// simplification and UV unwrapping can digest.
+// mesh as a consistently-oriented offset surface at distance
+// eps = band·scale/res.
+//
+// The reference implicit function is f = UDF − eps. That zero set is the
+// boundary of a tubular neighborhood, so a closed solid comes out as two
+// walls: the outer offset and a second surface ~2·eps inside. Downstream
+// decimation and the atlas then spend about half their budget on the hidden
+// wall. This port signs the field (positive outside the solid) and extracts
+// f = SDF − eps, whose only zero is the outer offset. Components whose
+// winding cannot be oriented fall back to the unsigned band so an open
+// sheet is not deleted. The quad assembly, winding tables, and project_back
+// lerp are otherwise the reference algorithm.
 #pragma once
 #include "dual_grid.h"
 
