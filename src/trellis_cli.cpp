@@ -543,7 +543,7 @@ int trellis_run_mv(const trellis::TrellisParams& cfg) {
         const int dband = cfg.band > 0 ? cfg.band : 1;
         trellis::Mesh rm = trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(), dbvh, so.res, dband);
         if (rm.F() > 0) {
-            trellis::clean_mesh(rm.V(), rm.faces);
+            trellis::clean_mesh(rm.verts.data(), rm.V(), rm.faces);
             trellis::drop_pre_decimation_components(rm.verts, rm.faces, trellis::remesh_voxel_world(so.res, dband));
         }
         const std::vector<float>& dverts = rm.F() > 0 ? rm.verts : mesh.verts;
@@ -578,7 +578,7 @@ int trellis_run_mv(const trellis::TrellisParams& cfg) {
         int remesh_band = cfg.band > 0 ? cfg.band : 1;   // MV default: 1 (see dump_post branch above)
         trellis::Mesh rm = trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(), bvh, so.res, remesh_band);
         if (rm.F() > 0) {
-            trellis::clean_mesh(rm.V(), rm.faces);
+            trellis::clean_mesh(rm.verts.data(), rm.V(), rm.faces);
             // 2% always, plus a detached shell under 3% of the body. Measured
             // here, before QEM. The post-QEM pass is a plain 3% face cut: the
             // pieces that sit ~2 voxels inside the wall are under 3% and are
@@ -1014,7 +1014,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                                                           mesh.faces.data(), mesh.F(),
                                                           dbvh, so.res, dband);
         if (rm.F() > 0) {
-            trellis::clean_mesh(rm.V(), rm.faces);
+            trellis::clean_mesh(rm.verts.data(), rm.V(), rm.faces);
             trellis::drop_pre_decimation_components(rm.verts, rm.faces, trellis::remesh_voxel_world(so.res, dband));
         }
         const std::vector<float>&   dverts = rm.F() > 0 ? rm.verts : mesh.verts;
@@ -1085,7 +1085,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // quadric + skinny-triangle cost, so no Taubin pre-pass is needed (and none is applied,
         // which keeps the mesh aligned to the voxel PBR volume for correct texture sampling).
         if (rm.F() > 0) {
-            trellis::clean_mesh(rm.V(), rm.faces);
+            trellis::clean_mesh(rm.verts.data(), rm.V(), rm.faces);
             int ndrop = trellis::drop_pre_decimation_components(rm.verts, rm.faces, trellis::remesh_voxel_world(so.res, remesh_band));
             printf("  remesh postproc: dropped %d floater comps -> V=%d F=%d\n", ndrop, rm.V(), rm.F());
             fflush(stdout);

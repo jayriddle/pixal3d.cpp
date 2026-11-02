@@ -56,7 +56,7 @@ bool pixal3d_write_production_glb(const std::string& out_glb, Mesh mesh,
     plog(os, "postprocess: remesh begin res=%d band=%d", rres, opt.remesh_band);
     Mesh rm = remesh_narrow_band_dc(mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(), bvh, rres, opt.remesh_band);
     if (rm.F() > 0) {
-        clean_mesh(rm.V(), rm.faces);
+        clean_mesh(rm.verts.data(), rm.V(), rm.faces);
         int ndrop = drop_pre_decimation_components(rm.verts, rm.faces, remesh_voxel_world(rres, opt.remesh_band));
         plog(os, "postprocess: remesh done V=%d F=%d dropped=%d", rm.V(), rm.F(), ndrop);
     } else plog(os, "postprocess: remesh empty, using decoded mesh");

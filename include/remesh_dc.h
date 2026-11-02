@@ -5,14 +5,15 @@
 // eps = band·scale/res.
 //
 // The reference implicit function is f = UDF − eps. That zero set is the
-// boundary of a tubular neighborhood, so a closed solid comes out as two
-// walls: the outer offset and a second surface ~2·eps inside. Downstream
-// decimation and the atlas then spend about half their budget on the hidden
-// wall. This port signs the field (positive outside the solid) and extracts
-// f = SDF − eps, whose only zero is the outer offset. Components whose
-// winding cannot be oriented fall back to the unsigned band so an open
-// sheet is not deleted. The quad assembly, winding tables, and project_back
-// lerp are otherwise the reference algorithm.
+// boundary of a tube, so a closed solid comes out as two walls about 2·eps
+// apart. Sign does not come from face winding (a decoded Pixal shell is a
+// thin, inconsistently wound band). Empty cells are flood-filled from the
+// domain boundary; reachable cells are exterior and everything sealed off,
+// including the hollow interior, is inside. The extracted level is the
+// boundary of that exterior, offset by eps — the outer wall only. Where the
+// flood can walk around the surface, that region stays on the unsigned band.
+// A component that still lands inside-out or in the interior is replaced by
+// the unsigned band. Quad assembly and project_back are otherwise unchanged.
 #pragma once
 #include "dual_grid.h"
 

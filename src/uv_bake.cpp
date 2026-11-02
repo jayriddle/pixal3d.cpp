@@ -338,8 +338,7 @@ int weld_vertices(std::vector<float>& verts, std::vector<int32_t>& faces, std::v
     return welded;
 }
 
-void clean_mesh(int V, std::vector<int32_t>& faces) {
-    (void)V;
+void clean_mesh(const float* verts, int V, std::vector<int32_t>& faces) {
     // 1. drop degenerate faces (a repeated vertex -> zero area, blocks collapse)
     {
         std::vector<int32_t> kept; kept.reserve(faces.size());
@@ -350,7 +349,7 @@ void clean_mesh(int V, std::vector<int32_t>& faces) {
         faces.swap(kept);
     }
     const int F = (int)(faces.size() / 3);
-    if (F == 0) return;
+    if (F == 0 || !verts || V <= 0) return;
     // 2. undirected edge -> incident faces
     std::unordered_map<uint64_t, std::vector<int>> ef;
     ef.reserve((size_t)F * 3);
@@ -361,6 +360,8 @@ void clean_mesh(int V, std::vector<int32_t>& faces) {
         for (int j = 0; j < 3; ++j) ef[ek(faces[3*f+j], faces[3*f+(j+1)%3])].push_back(f);
     // 3. BFS flood; flip faces to a consistent winding across manifold (exactly-2-face) edges.
     // Non-manifold / boundary edges are not crossed, so orientation stays locally consistent.
+    // The seed face's absolute winding is arbitrary: a later pass flips any nearly-closed
+    // vertex-component whose signed volume is negative, so the shell cannot come out inside-out.
     std::vector<char> vis(F, 0), flip(F, 0);
     std::vector<int> st;
     for (int seed = 0; seed < F; ++seed) {
@@ -386,7 +387,78 @@ void clean_mesh(int V, std::vector<int32_t>& faces) {
     }
     int nf = 0;
     for (int f = 0; f < F; ++f) if (flip[f]) { std::swap(faces[3*f+1], faces[3*f+2]); ++nf; }
-    printf("    [clean] faces=%d, flipped %d for consistent winding\n", F, nf);
+
+    std::vector<int> par((size_t)V);
+    for (int i = 0; i < V; ++i) par[i] = i;
+    auto find = [&](int x) {
+        while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; }
+        return x;
+    };
+    auto uni = [&](int a, int b) {
+        if (a < 0 || b < 0 || a >= V || b >= V) return;
+        a = find(a); b = find(b);
+        if (a != b) par[a] = b;
+    };
+    for (int f = 0; f < F; ++f) {
+        uni(faces[3*f], faces[3*f+1]);
+        uni(faces[3*f+1], faces[3*f+2]);
+    }
+    std::unordered_map<int, int> cid;
+    std::vector<int> fcomp((size_t)F, -1);
+    for (int f = 0; f < F; ++f) {
+        const int a = faces[3*f];
+        if (a < 0 || a >= V) continue;
+        const int r = find(a);
+        auto it = cid.find(r);
+        if (it == cid.end()) it = cid.emplace(r, (int)cid.size()).first;
+        fcomp[f] = it->second;
+    }
+    const int nc = (int)cid.size();
+    std::vector<double> vol((size_t)nc, 0.0);
+    std::vector<int> fc((size_t)nc, 0), boundary((size_t)nc, 0);
+    for (int f = 0; f < F; ++f) {
+        const int c = fcomp[f];
+        if (c < 0) continue;
+        fc[c]++;
+        const float* pa = verts + 3*faces[3*f];
+        const float* pb = verts + 3*faces[3*f+1];
+        const float* pc = verts + 3*faces[3*f+2];
+        const double e1x = pb[0]-pa[0], e1y = pb[1]-pa[1], e1z = pb[2]-pa[2];
+        const double e2x = pc[0]-pa[0], e2y = pc[1]-pa[1], e2z = pc[2]-pa[2];
+        const double nx = e1y*e2z - e1z*e2y;
+        const double ny = e1z*e2x - e1x*e2z;
+        const double nz = e1x*e2y - e1y*e2x;
+        vol[c] += pa[0]*nx + pa[1]*ny + pa[2]*nz;
+    }
+    struct EK { uint64_t k; int c; };
+    std::vector<EK> edges;
+    edges.reserve((size_t)F * 3);
+    for (int f = 0; f < F; ++f) {
+        if (fcomp[f] < 0) continue;
+        for (int j = 0; j < 3; ++j)
+            edges.push_back({ek(faces[3*f+j], faces[3*f+(j+1)%3]), fcomp[f]});
+    }
+    std::sort(edges.begin(), edges.end(), [](const EK& p, const EK& q) {
+        if (p.k != q.k) return p.k < q.k;
+        return p.c < q.c;
+    });
+    for (size_t i = 0; i < edges.size();) {
+        size_t j = i + 1;
+        while (j < edges.size() && edges[j].k == edges[i].k && edges[j].c == edges[i].c) ++j;
+        if ((int)(j - i) == 1) boundary[edges[i].c]++;
+        i = j;
+    }
+    int nrev = 0;
+    for (int c = 0; c < nc; ++c) {
+        // A handful of crack edges still encloses volume. A real opening does not.
+        if ((int64_t)boundary[c] * 100 > (int64_t)std::max(fc[c], 1)) continue;
+        if (!(vol[c] < 0.0)) continue;
+        ++nrev;
+        for (int f = 0; f < F; ++f)
+            if (fcomp[f] == c) std::swap(faces[3*f+1], faces[3*f+2]);
+    }
+    printf("    [clean] faces=%d, flipped %d for consistent winding (%d components reversed outward)\n",
+           F, nf, nrev);
     fflush(stdout);
 }
 
