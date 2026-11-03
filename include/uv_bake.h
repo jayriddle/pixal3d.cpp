@@ -113,11 +113,13 @@ int fill_holes(std::vector<float>& verts, std::vector<int32_t>& faces, float max
 void taubin_smooth(std::vector<float>& verts, const std::vector<int32_t>& faces,
                    int iters = 5, float lambda = 0.5f, float mu = -0.53f);
 
-// In-place cleanup of a welded surface mesh (faces only) so meshopt's guarded quadric collapse
-// reaches the target without the roughening FQMS fallback: drop degenerate/duplicate faces and
+// In-place cleanup of a welded surface mesh so meshopt's guarded quadric collapse
+// reaches the target without the roughening FQMS fallback: drop degenerate faces and
 // unify face orientations by BFS over manifold-edge adjacency. The narrow-band DC output is ~11%
 // inconsistently wound + non-manifold, which otherwise stalls meshopt and forces FQMS.
-void clean_mesh(int V, std::vector<int32_t>& faces);
+// `verts` is required: after the relative BFS, each nearly-closed component whose
+// signed volume is negative is flipped so a consistent shell cannot be left inside-out.
+void clean_mesh(const float* verts, int V, std::vector<int32_t>& faces);
 
 // Fan-fill boundary loops of at most max_loop edges in place; returns the number of holes filled.
 int fill_small_holes(std::vector<int32_t>& faces, int max_loop = 64);

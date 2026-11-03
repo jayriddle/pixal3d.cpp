@@ -107,6 +107,11 @@ jobs:
       - name: Run the trellis-server contract test
         run: bash tests/server_contract.sh ./build/trellis-server
 
+      # Narrow-band remesh must drop the inner offset wall. Synthetic cube / sphere /
+      # open sheet / recess / thin ridge — no model weights.
+      - name: Run the outer-shell remesh test
+        run: ./build/trellis-test-remesh-shell
+
       - name: Show binaries
         if: always()
         run: ls -la build/trellis-cli build/trellis-server build/trellis-test-* 2>/dev/null | head -30

@@ -1,9 +1,25 @@
-// Narrow-band UDF dual-contouring remesh, ported from the reference
+// Narrow-band dual-contouring remesh, ported from the reference
 // (CuMesh remeshing.py::remesh_narrow_band_dc + simple_dual_contour.cu; see
 // docs/spec/27-reference-postprocess.md §4). Rebuilds a noisy voxel-derived
-// mesh as the closed, consistently-oriented offset surface at distance
-// eps = band·scale/res around it — one watertight manifold that downstream
-// simplification and UV unwrapping can digest.
+// mesh as a consistently-oriented offset surface at distance
+// eps = band·scale/res.
+//
+// The reference implicit function is f = UDF − eps. That zero set is the
+// boundary of a tube, so a closed solid comes out as two walls about 2·eps
+// apart. Sign does not come from face winding (a decoded Pixal shell is a
+// thin, inconsistently wound band). Empty cells in the narrow band are
+// flood-filled from outside the vertex box; reachable cells are exterior and
+// everything the surface seals off, including the hollow interior, is inside.
+// The extracted level is the boundary of that exterior, offset by eps — the
+// outer wall only. Where the flood can walk around the surface, that region
+// stays on the unsigned band. Per component, the signed shell is kept only
+// when it still covers the unsigned outer sheet (outer vertices within
+// 1.5·eps, allowing a few ppm of outliers), has no open edges after local
+// pinch-loop repair, and does not
+// drop or split a real piece. A single shell that would fall under the
+// existing 2%/3% floater cuts is kept as the double shell instead. Otherwise
+// that component keeps the double shell. Quad assembly and project_back are
+// otherwise unchanged.
 #pragma once
 #include "dual_grid.h"
 

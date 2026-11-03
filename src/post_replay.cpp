@@ -128,7 +128,7 @@ int main(int argc, char** argv) {
         audit("remesh", rm.faces);
         // match the CLI: clean degenerates/unify winding, drop floater components
         if (rm.F() > 0) {
-            trellis::clean_mesh(rm.V(), rm.faces);
+            trellis::clean_mesh(rm.verts.data(), rm.V(), rm.faces);
             audit("clean_mesh", rm.faces);
             const float voxel = trellis::remesh_voxel_world(res, band);
             int ndrop = trellis::drop_pre_decimation_components(rm.verts, rm.faces, voxel);
