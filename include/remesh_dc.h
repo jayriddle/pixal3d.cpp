@@ -13,8 +13,9 @@
 // The extracted level is the boundary of that exterior, offset by eps — the
 // outer wall only. Where the flood can walk around the surface, that region
 // stays on the unsigned band. Per component, the signed shell is kept only
-// when it still covers the unsigned outer sheet (every outer vertex within
-// 1.5·eps), has no open edges after local pinch-loop repair, and does not
+// when it still covers the unsigned outer sheet (outer vertices within
+// 1.5·eps, allowing a few ppm of outliers), has no open edges after local
+// pinch-loop repair, and does not
 // drop or split a real piece. A single shell that would fall under the
 // existing 2%/3% floater cuts is kept as the double shell instead. Otherwise
 // that component keeps the double shell. Quad assembly and project_back are

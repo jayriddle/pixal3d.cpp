@@ -946,6 +946,106 @@ void test_floater_share() {
     check(after_foot > 20, "floater: shell change put the foot under the 2%/3% cut");
 }
 
+// Wide contact, not a point bridge. The repair fan's centroid sits more than
+// 1.5*eps off the outer sheet; it must still be counted with the shell so the
+// piece stays closed and the inner wall is dropped.
+void test_repair_patch_closed() {
+    const float scale = (float)(kRes + 3 * kBand) / (float)kRes;
+    const float cell = scale / (float)kRes;
+    const float eps = shell_eps();
+    const float hx = 0.26f, hy = 0.16f, hz = 0.18f;
+    const float cx = 0.04f, cy = -0.03f, cz = 0.05f;
+    const float gap = 2.4f * cell;
+    Built outer = make_box(12, hx, hy, hz, cx, cy, cz);
+    Built inner = make_box(8, hx - gap, hy - gap, hz - gap, cx, cy, cz);
+    const float win = 3.5f * eps;
+    shift_face(inner.v, 0, cx + (hx - gap), 1, cy, win, 2, cz, win, gap);
+    shift_face(inner.v, 2, cz + (hz - gap), 0, cx - 0.05f, win, 1, cy + 0.04f, win * 0.6f, gap);
+    shift_face(inner.v, 2, cz - (hz - gap), 0, cx + 0.04f, win * 0.6f, 1, cy - 0.03f, win * 0.6f, -gap);
+    const int base = (int)(outer.v.size() / 3);
+    append_mesh(outer, inner);
+    auto closest = [](const std::vector<float>& v, int lo, int hi, const float p[3]) {
+        int best = lo;
+        float best2 = 1e30f;
+        for (int i = lo; i < hi; ++i) {
+            const float d0 = v[3 * i] - p[0], d1 = v[3 * i + 1] - p[1], d2 = v[3 * i + 2] - p[2];
+            const float d = d0 * d0 + d1 * d1 + d2 * d2;
+            if (d < best2) { best2 = d; best = i; }
+        }
+        return best;
+    };
+    const float sites[3][3] = {
+        {cx + hx - 0.25f * cell, cy, cz},
+        {cx - 0.05f, cy + 0.04f, cz + hz - 0.25f * cell},
+        {cx + 0.04f, cy - 0.03f, cz - hz + 0.25f * cell},
+    };
+    for (const auto& q : sites) {
+        const int iv = closest(outer.v, base, (int)(outer.v.size() / 3), q);
+        const int ov = closest(outer.v, 0, base, q);
+        outer.f.insert(outer.f.end(), {ov, std::min(ov + 1, base - 1), iv,
+                                        std::min(ov + 1, base - 1), std::min(iv + 1, (int)(outer.v.size() / 3) - 1), iv});
+    }
+    std::printf("\n== repair patch on a wide pinch ==\n");
+    const trellis::Mesh m = remesh(outer.v, outer.f);
+    const double area = 8.0 * ((double)hx * hy + (double)hy * hz + (double)hz * hx);
+    const double expect = 2.0 * area / ((double)cell * cell);
+    std::printf("  [repair] V=%d F=%d boundary=%d comps=%d expect=%.0f\n",
+                m.V(), m.F(), boundary_edges(m.faces), component_count(m.faces, m.V()), expect);
+    check(boundary_edges(m.faces) == 0, "repair: patch left the shell open");
+    check(m.F() > (int)(expect * 0.45f), "repair: shell collapsed");
+    check(m.F() < (int)(expect * 1.55f), "repair: unassigned patch forced a double-wall fallback");
+    check(component_count(m.faces, m.V()) == 1, "repair: extra pieces");
+    check(signed_volume(m.verts, m.faces) > 0.0, "repair: inward winding");
+}
+
+// Four vertices sit 2.2*eps off the cube. That is past the 1.5*eps band and
+// well under a part-sized miss, so the outer shell stays and the inner wall goes.
+void test_coverage_outlier() {
+    const float h = 0.25f;
+    const float eps = shell_eps();
+    Built b = make_cube(12, h, 0.f, 0.f, 0.f);
+    int moved = 0;
+    for (size_t i = 0; i + 2 < b.v.size() && moved < 4; i += 3) {
+        if (std::fabs(b.v[i] - h) > 1e-5f) continue;
+        b.v[i] += 2.2f * eps;
+        ++moved;
+    }
+    std::printf("\n== coverage outliers (%d verts at 2.2 eps) ==\n", moved);
+    check(moved == 4, "coverage: did not place four outliers");
+    const trellis::Mesh m = remesh(b.v, b.f);
+    const int deep = deep_inside_box(m.verts, 0.f, 0.f, 0.f, h, 0.45f * eps);
+    const double naive = 6.0 * (2.0 * h) * (2.0 * h) / ((double)shell_eps() * (double)(kRes) / (double)(kRes + 3 * kBand));
+    (void)naive;
+    const float scale = (float)(kRes + 3 * kBand) / (float)kRes;
+    const float cell = scale / (float)kRes;
+    const double expect = 2.0 * (6.0 * (2.0 * h) * (2.0 * h)) / ((double)cell * cell);
+    std::printf("  [coverage] V=%d F=%d boundary=%d deep=%d expect=%.0f\n",
+                m.V(), m.F(), boundary_edges(m.faces), deep, expect);
+    check(boundary_edges(m.faces) == 0, "coverage: open edges");
+    check(deep == 0, "coverage: a handful of outliers kept the inner wall");
+    check(m.F() < (int)(expect * 1.55), "coverage: outliers forced a double-wall fallback");
+    check(signed_volume(m.verts, m.faces) > 0.0, "coverage: inward winding");
+}
+
+// Speck under 2% of the unsigned body must be dropped. Sizing the cut from the
+// single-shelled body would keep a remnant this small as a double shell.
+void test_floater_cut_body() {
+    Built body = make_cube(12, 0.24f, -0.10f, 0.f, 0.f);
+    Built speck = make_cube(3, 0.018f, 0.40f, 0.12f, 0.f);
+    append_mesh(body, speck);
+    std::printf("\n== floater cut against unsigned body ==\n");
+    trellis::Mesh m = remesh(body.v, body.f);
+    const int before = count_x(m.verts, 0.34f, 0.46f);
+    std::printf("  [floater-cut] V=%d F=%d comps=%d speck_verts=%d\n",
+                m.V(), m.F(), component_count(m.faces, m.V()), before);
+    check(before > 0, "floater-cut: speck missing before the filter");
+    const float voxel = trellis::remesh_voxel_world(kRes, kBand);
+    trellis::drop_pre_decimation_components(m.verts, m.faces, voxel);
+    const int after = count_x(m.verts, 0.34f, 0.46f);
+    std::printf("  [floater-cut] speck_verts %d -> %d\n", before, after);
+    check(after == 0, "floater-cut: remnant under 2% of the unsigned body was kept");
+}
+
 void test_clean_restores_outward() {
     Built b = make_cube(10, 0.25f, 0.f, 0.f, 0.f);
     trellis::Mesh m = remesh(b.v, b.f);
@@ -984,6 +1084,9 @@ int main() {
     test_filled_cube_recesses();
     test_pinches();
     test_floater_share();
+    test_repair_patch_closed();
+    test_coverage_outlier();
+    test_floater_cut_body();
     test_clean_restores_outward();
     if (g_fails) {
         std::fprintf(stderr, "\n%d check(s) failed\n", g_fails);

@@ -951,8 +951,14 @@ Mesh choose_shell(Mesh U, Mesh S, const ExteriorGrid& grid, float eps, int band,
     occ.bits.clear();
     occ.cells.clear();
     for (int c = 0; c < nu; ++c) {
-        if (checked[c] == 0) why[c] = kDropInterior;
-        else if (misses[c] > 0) why[c] = kCoverage;
+        if (checked[c] == 0) { why[c] = kDropInterior; continue; }
+        // A handful of vertices past 1.5·eps (a few ppm, and at least 4) is
+        // numerical noise. A real missing region is far more than that.
+        const int64_t allow = std::max<int64_t>(4, (int64_t)checked[c] * 5 / 1000000);
+        if ((int64_t)misses[c] > allow) why[c] = kCoverage;
+        else if (misses[c] > 0)
+            printf("  remesh postproc: outer shell coverage kept faces=%d misses=%d/%d max_gap=%.4g eps=%.4g\n",
+                   u_faces[c], misses[c], checked[c], max_gap[c], eps);
     }
 
     NearGrid outer_occ;
@@ -971,6 +977,39 @@ Mesh choose_shell(Mesh U, Mesh S, const ExteriorGrid& grid, float eps, int band,
         float d = 0.f;
         const int vi = outer_occ.nearest(q, U.verts, d, gap_lim);
         if (vi >= 0 && d <= gap_lim && u_vert[vi] >= 0) s_asg[f] = u_vert[vi];
+    }
+    // Repair fans and the seam faces they border sit off the outer sheet, so a
+    // 1.5·eps centroid test leaves them unassigned. Their edges then count as
+    // open and assembly drops the patch. Grow the assignment across shared edges.
+    {
+        std::unordered_map<uint64_t, std::vector<int>> edge_faces;
+        edge_faces.reserve((size_t)S.F() * 2);
+        for (int f = 0; f < S.F(); ++f) {
+            for (int j = 0; j < 3; ++j) {
+                int a = S.faces[3 * f + j], b = S.faces[3 * f + (j + 1) % 3];
+                if (a > b) std::swap(a, b);
+                edge_faces[edge_key(a, b)].push_back(f);
+            }
+        }
+        std::vector<int> grow;
+        grow.reserve((size_t)S.F());
+        for (int f = 0; f < S.F(); ++f) if (s_asg[f] >= 0) grow.push_back(f);
+        for (size_t qi = 0; qi < grow.size(); ++qi) {
+            const int f = grow[qi];
+            const int c = s_asg[f];
+            if (c < 0) continue;
+            for (int j = 0; j < 3; ++j) {
+                int a = S.faces[3 * f + j], b = S.faces[3 * f + (j + 1) % 3];
+                if (a > b) std::swap(a, b);
+                auto it = edge_faces.find(edge_key(a, b));
+                if (it == edge_faces.end()) continue;
+                for (int o : it->second) {
+                    if (s_asg[o] >= 0) continue;
+                    s_asg[o] = c;
+                    grow.push_back(o);
+                }
+            }
+        }
     }
 
     std::vector<int> s_boundary;
@@ -1020,11 +1059,6 @@ Mesh choose_shell(Mesh U, Mesh S, const ExteriorGrid& grid, float eps, int band,
     // would have kept under the 2% cut, or under the 3% cut when it is detached.
     {
         const float voxel = grid.scale / (float)std::max(grid.res, 1);
-        auto proposed = [&](int c) -> int {
-            if (why[c] == kDropInterior) return 0;
-            if (why[c] == kKeep) return s_faces[c];
-            return u_faces[c];
-        };
         auto box_gap = [&](int c, int body) -> float {
             float acc = 0.f;
             for (int k = 0; k < 3; ++k) {
@@ -1037,15 +1071,18 @@ Mesh choose_shell(Mesh U, Mesh S, const ExteriorGrid& grid, float eps, int band,
             }
             return std::sqrt(acc);
         };
-        int largest = 0, body = 0;
+        // Cuts match drop_pre_decimation_components against the unsigned body.
+        // Using the already single-shelled face count shrinks the denominator
+        // and lets a remnant under 2% of the real body clear the cut.
+        int body_faces = 0, body = 0;
         for (int c = 0; c < nu; ++c) {
-            const int n = proposed(c);
-            if (n > largest) { largest = n; body = c; }
+            if (why[c] == kDropInterior) continue;
+            if (u_faces[c] > body_faces) { body_faces = u_faces[c]; body = c; }
         }
-        const int cut2 = (int)(0.02 * largest);
-        const int cut3 = (int)(0.03 * largest);
+        const int cut2 = (int)(0.02 * body_faces);
+        const int cut3 = (int)(0.03 * body_faces);
         for (int c = 0; c < nu; ++c) {
-            if (why[c] != kKeep || c == body || largest <= 0) continue;
+            if (why[c] != kKeep || c == body || body_faces <= 0) continue;
             const int sf = s_faces[c], uf = u_faces[c];
             if (uf < cut2) continue;
             const bool lose2 = sf < cut2;
